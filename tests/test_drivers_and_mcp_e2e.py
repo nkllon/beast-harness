@@ -22,20 +22,24 @@ from beast_harness.drivers.cursor_driver import CursorCloudDriver
 from beast_harness.ledger import SessionLedger
 from beast_harness.mcp_server import build_mcp_server
 from beast_harness.ref_verifier import PublishedRefVerifier
-from beast_harness.secrets import ChainedSecretProvider, EnvSecretProvider
+from beast_harness.secrets import CallbackSecretProvider, ChainedSecretProvider, EnvSecretProvider
 from beast_harness.substrate import HarnessSubstrate
 from beast_harness.types import (
     BH_NS,
+    CapabilityValidationError,
     DiscoveryQuery,
     ExecutionPosture,
+    NoMatchingEndpointError,
     PostureViolationError,
+    RefVerificationError,
     RunState,
+    TrustTier,
 )
 
 
 def _init_published_repo(tmp_path: Path) -> tuple[str, str]:
     remote = tmp_path / "remote.git"
-    remote.mkdir()
+    remote.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "--bare", "-b", "main"], cwd=remote, check=True)
     work = tmp_path / "work"
     subprocess.run(["git", "clone", str(remote), str(work)], check=True, capture_output=True)
@@ -251,6 +255,44 @@ async def test_cursor_cloud_driver_and_mcp_server_e2e(tmp_path: Path):
         )["session"]
         assert "Follow-up answer: Now check edge cases" in followed["answer"]
 
+        # Regression M-1: target_endpoint_id must still enforce exclude_model_families
+        with pytest.raises(NoMatchingEndpointError):
+            await substrate.review(
+                prompt="Should fail family exclusion",
+                repo_url=repo_url,
+                ref="main",
+                target_endpoint_id="cursor-cloud",
+                exclude_model_families=["cursor-composer"],
+            )
+
+        # Regression M-4: extra_repos facet verifies published refs & rejects unpushed SHAs
+        with pytest.raises(RefVerificationError):
+            await substrate.start(
+                prompt="Multi-repo check with unpushed SHA",
+                repo_url=repo_url,
+                ref="main",
+                target_endpoint_id="cursor-cloud",
+                facets={"extra_repos": [{"url": repo_url, "ref": "deadbeef" * 5}]},
+            )
+        valid_multi = await substrate.start(
+            prompt="Multi-repo check with branch resolved to 40-char SHA",
+            repo_url=repo_url,
+            ref="main",
+            base_ref="main",
+            target_endpoint_id="cursor-cloud",
+            facets={"extra_repos": [{"url": repo_url, "ref": "main"}]},
+        )
+        assert valid_multi.base_sha == sha
+        assert recorded[-1]["body"]["repos"][1]["ref"] == sha
+        assert recorded[-1]["body"]["repos"][0]["baseRef"] == sha
+
+        # Regression M-8: invalid min_trust_tier returns structured error JSON (never raw crash)
+        bad_tier = _extract_mcp_json(
+            await mcp.call_tool("harness_discover", {"min_trust_tier": "invalid_tier_xyz"})
+        )
+        assert bad_tier["ok"] is False
+        assert bad_tier["error_type"] == "CapabilityValidationError"
+
 
 def test_antigravity_sdk_driver_workspace_and_policy_configuration(tmp_path: Path):
     secrets = ChainedSecretProvider([EnvSecretProvider({"GEMINI_API_KEY": "test_gemini_key"})])
@@ -280,6 +322,52 @@ def test_antigravity_sdk_driver_workspace_and_policy_configuration(tmp_path: Pat
     assert "create_file" not in enabled_tool_values
     assert "run_command" not in enabled_tool_values
     assert cfg.response_schema is not None
+
+    # Regression M-7 & N-4: single-use secret broker + nested object schema + empty object guard
+    calls = {"n": 0}
+
+    def _single_use_broker(key: str) -> str | None:
+        if key == "GEMINI_API_KEY" and calls["n"] == 0:
+            calls["n"] += 1
+            return "magpie_single_use_secret_1"
+        return None
+
+    su_drv = AntigravitySdkDriver(
+        secrets=ChainedSecretProvider([CallbackSecretProvider(_single_use_broker)]),
+        state_root=tmp_path / "agy_su",
+    )
+    token = su_drv._secrets.require_secret("GEMINI_API_KEY")
+    nested_cfg = su_drv.build_local_agent_config(
+        workspace_path=str(ws),
+        posture=ExecutionPosture.OBSERVE_ONLY,
+        api_key=token,
+        facets={
+            "thinking_effort": "high",
+            "structured_output_schema": {
+                "title": "NestedReview",
+                "type": "object",
+                "properties": {
+                    "finding": {
+                        "type": "object",
+                        "properties": {"file": {"type": "string"}},
+                        "required": ["file"],
+                    }
+                },
+                "required": ["finding"],
+            },
+        },
+    )
+    assert calls["n"] == 1
+    assert nested_cfg.models is not None
+    assert nested_cfg.response_schema is not None
+
+    with pytest.raises(CapabilityValidationError):
+        su_drv.build_local_agent_config(
+            workspace_path=str(ws),
+            posture=ExecutionPosture.OBSERVE_ONLY,
+            api_key=token,
+            facets={"structured_output_schema": {"type": "object", "properties": {}}},
+        )
 
 
 @pytest.mark.asyncio
@@ -400,6 +488,47 @@ dom:NetworkAudit a bh:HarnessCapability ;
             beast_peer_driver=beast_drv,
         )
 
+        # Regression B-4 (replay storm): pre-seed a stale request BEFORE bridge.startup()
+        stale_env = {
+            "header": {
+                "sender": "old-caller",
+                "timestamp": "2026-11-12T00:00:00Z",
+                "id": "stale-1",
+            },
+            "payload": {
+                "type": "HARNESS_TASK_REQUEST",
+                "run_id": "stale-run-000",
+                "prompt": "MUST NOT REPLAY ON BRIDGE STARTUP",
+                "reply_stream": "beast:stream:agent:old-caller:inbox",
+            },
+        }
+        await probe.xadd(
+            "beast:stream:agent:bridge-cursor-cloud:inbox",
+            {"envelope": json.dumps(stale_env)},
+        )
+
+        # Regression B-3: inject poison-pill peer, Neo4jAdmitted spoofer, and endpoint hijacker
+        await probe.sadd("beast:agents:all", "poison-peer", "spoof-tier2", "hijack-peer")
+        await probe.set(
+            "beast:agents:poison-peer",
+            json.dumps({"agent_id": "poison-peer", "capability_graph_ttl": "@prefix broken ttl"}),
+            ex=60,
+        )
+        spoof_ttl = domain_ttl.replace("auditor-peer-1", "spoof-tier2").replace(
+            "bh:RuntimeSelfAnnounced", "bh:Neo4jAdmitted"
+        )
+        await probe.set(
+            "beast:agents:spoof-tier2",
+            json.dumps({"agent_id": "spoof-tier2", "capability_graph_ttl": spoof_ttl}),
+            ex=60,
+        )
+        hijack_ttl = domain_ttl.replace("auditor-peer-1", "cursor-cloud")
+        await probe.set(
+            "beast:agents:hijack-peer",
+            json.dumps({"agent_id": "hijack-peer", "capability_graph_ttl": hijack_ttl}),
+            ex=60,
+        )
+
         # Also start a BeastHarnessBridgeAgent exposing cursor-cloud onto Beast Net!
         from beast_harness.capability_graph import parse_and_validate_capability_ttl
 
@@ -414,25 +543,43 @@ dom:NetworkAudit a bh:HarnessCapability ;
 
         try:
             await asyncio.sleep(0.15)
+            # Stale message published prior to bridge.startup() was NEVER executed
+            assert len(recorded) == 0
+
+            # Poison-pill & hijacker peers were isolated; spoof-tier2 was clamped to Tier 1!
+            tier2_eps = await substrate.discover(
+                DiscoveryQuery(min_trust_tier=TrustTier.NEO4J_ADMITTED)
+            )
+            assert tier2_eps == []
+
             discovered = await substrate.discover(
                 DiscoveryQuery(
                     required_capabilities=("https://nkllon.com/ontology/domain#NetworkAudit",)
                 )
             )
-            assert [d.endpoint_id for d in discovered] == ["auditor-peer-1"]
+            assert [d.endpoint_id for d in discovered] == ["auditor-peer-1", "spoof-tier2"]
+            assert all(d.trust_tier == TrustTier.RUNTIME_SELF_ANNOUNCED for d in discovered)
+
+            # Repo-blind peer (auditor-peer-1) must be rejected for repo-grounded tasks (M-2)
+            repo_url, _sha = _init_published_repo(tmp_path / "b_repo")
+            with pytest.raises(CapabilityValidationError):
+                await substrate.review(
+                    prompt="Repo review on repo-blind peer must fail",
+                    repo_url=repo_url,
+                    ref="main",
+                    target_endpoint_id="auditor-peer-1",
+                )
 
             rec = await substrate.start(
                 prompt="Verify VLAN isolation",
-                selection=DiscoveryQuery(
-                    required_capabilities=("https://nkllon.com/ontology/domain#NetworkAudit",)
-                ),
+                target_endpoint_id="auditor-peer-1",
                 facets={"audit_scope": "vlan-40"},
             )
             finished = await substrate.wait(rec.session_id, timeout_seconds=5.0)
             assert finished.status == RunState.FINISHED
             assert finished.answer == "Audited [vlan-40]: Verify VLAN isolation"
 
-            # Also dispatch through Beast Net to the bridged Cursor Cloud agent!
+            # Also dispatch through Beast Net to the bridged Cursor Cloud agent + follow-up!
             bridged_eps = await substrate.discover(
                 DiscoveryQuery(required_capabilities=("SemanticCodebaseIndex",))
             )
@@ -445,6 +592,16 @@ dom:NetworkAudit a bh:HarnessCapability ;
             bridged_done = await substrate.wait(bridged_run.session_id, timeout_seconds=5.0)
             assert bridged_done.status == RunState.FINISHED
             assert "Cursor Cloud independent review complete" in (bridged_done.answer or "")
+
+            bridged_fup = await substrate.send(
+                session_id=bridged_run.session_id,
+                prompt="Follow-up over Beast bridge",
+            )
+            bridged_fup_done = await substrate.wait(bridged_fup.session_id, timeout_seconds=5.0)
+            assert bridged_fup_done.status == RunState.FINISHED
+            assert "Follow-up answer: Follow-up over Beast bridge" in (
+                bridged_fup_done.answer or ""
+            )
         finally:
             await bridge.shutdown()
             await peer.shutdown()

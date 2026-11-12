@@ -93,6 +93,33 @@ def test_published_ref_verifier_accepts_remote_sha_and_rejects_unpushed_commit(
     verifier.cleanup_worktree(wt)
     assert not wt.exists()
 
+    # Regression B-1: reject git option injection and embedded URL userinfo credentials
+    for malicious_url in (
+        "--upload-pack=touch /tmp/pwn",
+        "-oProxyCommand=evil",
+        "https://user:secret_token@github.com/nkllon/beast-harness.git",
+    ):
+        with pytest.raises(RefVerificationError):
+            verifier.verify_published_ref(malicious_url, "main")
+
+    with pytest.raises(RefVerificationError):
+        verifier.verify_published_ref(str(remote), "--upload-pack=evil")
+
+    # Regression B-2: reject '.' and '..' session_ids without wiping worktree_root
+    sentinel = verifier.worktree_root / "keep.txt"
+    sentinel.write_text("do-not-delete")
+    for bad_sid in (".", "..", "../escape", "-bad"):
+        with pytest.raises(RefVerificationError):
+            verifier.materialize_readonly_worktree(verified, session_id=bad_sid)
+    assert sentinel.exists()
+
+    # Regression M-3: writable=True worktree allows ProposeDiff edits cleanly
+    prop_wt = verifier.materialize_worktree(verified, session_id="sess-prop-1", writable=True)
+    prop_path = Path(prop_wt.local_worktree_path or "")
+    (prop_path / "module.py").write_text("def add(a: int, b: int) -> int:\n    return a + b + 0\n")
+    verifier.cleanup_worktree(prop_path)
+    assert not prop_path.exists()
+
 
 def test_chained_secret_provider_priority_and_redaction():
     secret_val = "crsr_super_secret_token_999"
@@ -158,3 +185,30 @@ def test_session_ledger_durability_and_independent_review_immutability(tmp_path:
     assert updated.answer == "No blocking defects found."
     assert updated.structured_output == {"verdict": "approve"}
     assert updated.audit_digest and len(updated.audit_digest) == 64
+
+    # Regression N-2: multi-turn non-review session accumulates audit_events across runs
+    ledger2.create_session(
+        session_id="sess-multi-1",
+        endpoint_id="cursor-cloud",
+        driver_id="cursor-cloud",
+        repo_ref=None,
+        posture=ExecutionPosture.OBSERVE_ONLY,
+        independent_review=False,
+        facets={},
+        initial_run=DriverRunResult(
+            native_agent_id="bc-multi",
+            run_id="run-1",
+            state=RunState.FINISHED,
+            audit_events=[{"turn": 1, "tool": "view_file"}],
+        ),
+    )
+    after_t2 = ledger2.update_from_driver_result(
+        "sess-multi-1",
+        DriverRunResult(
+            native_agent_id="bc-multi",
+            run_id="run-2",
+            state=RunState.FINISHED,
+            audit_events=[{"turn": 2, "tool": "search_directory"}],
+        ),
+    )
+    assert len(after_t2.audit_events) == 2

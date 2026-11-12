@@ -65,6 +65,6 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP"]
 
-[tool.uv.sources]
-beast-agent = { path = "../beast-agent-codex-capability-ttl", editable = true }
-beast-mailbox-core = { path = "../../cursor/beast-mailbox-core", editable = true }
+# For local sibling editable development prior to beast-agent 0.2.0 PyPI release:
+# [tool.uv.sources]
+# beast-agent = { path = "../beast-agent", editable = true }

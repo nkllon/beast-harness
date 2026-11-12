@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -41,7 +42,7 @@ class SessionLedger:
         return conn
 
     def _init_schema(self) -> None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS harness_sessions (
@@ -68,7 +69,6 @@ class SessionLedger:
                 )
                 """
             )
-            conn.commit()
 
     def _row_to_record(self, row: sqlite3.Row) -> SessionRecord:
         structured_raw = row["structured_output_json"]
@@ -92,7 +92,9 @@ class SessionLedger:
             audit_digest=row["audit_digest"],
             error_detail=row["error_detail"],
             created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
+            updated_at=datetime.fromisoformat(row["created_at"])
+            if row["updated_at"] is None
+            else datetime.fromisoformat(row["updated_at"]),
         )
 
     def create_session(
@@ -131,7 +133,7 @@ class SessionLedger:
             created_at=now,
             updated_at=now,
         )
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO harness_sessions (
@@ -167,11 +169,10 @@ class SessionLedger:
                     record.updated_at.isoformat(),
                 ),
             )
-            conn.commit()
         return record
 
     def get_session(self, session_id: str) -> SessionRecord:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT * FROM harness_sessions WHERE session_id = ?",
                 (session_id,),
@@ -188,9 +189,17 @@ class SessionLedger:
         clear_worktree: bool = False,
     ) -> SessionRecord:
         existing = self.get_session(session_id)
-        merged_events = (
-            list(result.audit_events) if result.audit_events else list(existing.audit_events)
-        )
+        if not result.audit_events:
+            merged_events = list(existing.audit_events)
+        elif result.run_id and result.run_id != existing.latest_run_id:
+            merged_events = [*existing.audit_events, *result.audit_events]
+        else:
+            # Same run_id: preserve prior events and append any newly observed steps
+            merged_events = list(existing.audit_events)
+            for ev in result.audit_events:
+                if ev not in merged_events:
+                    merged_events.append(ev)
+
         answer = result.answer if result.answer is not None else existing.answer
         structured = (
             result.structured_output
@@ -201,7 +210,7 @@ class SessionLedger:
         audit_digest = _compute_audit_digest(merged_events, result.state) or existing.audit_digest
         now = datetime.now(UTC)
 
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 UPDATE harness_sessions
@@ -231,7 +240,6 @@ class SessionLedger:
                     session_id,
                 ),
             )
-            conn.commit()
         return self.get_session(session_id)
 
     def assert_followup_allowed(self, session_id: str) -> SessionRecord:
@@ -244,7 +252,7 @@ class SessionLedger:
         return session
 
     def list_sessions(self, limit: int = 50) -> list[SessionRecord]:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT * FROM harness_sessions ORDER BY created_at DESC LIMIT ?",
                 (max(1, int(limit)),),

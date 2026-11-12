@@ -41,6 +41,26 @@ class TrustTier(StrEnum):
     RUNTIME_SELF_ANNOUNCED = f"{BH_NS}RuntimeSelfAnnounced"
     NEO4J_ADMITTED = f"{BH_NS}Neo4jAdmitted"
 
+    @classmethod
+    def from_shorthand(cls, value: str) -> TrustTier:
+        mapping = {
+            "tier1": cls.RUNTIME_SELF_ANNOUNCED,
+            "runtime": cls.RUNTIME_SELF_ANNOUNCED,
+            "runtime_self_announced": cls.RUNTIME_SELF_ANNOUNCED,
+            cls.RUNTIME_SELF_ANNOUNCED.value: cls.RUNTIME_SELF_ANNOUNCED,
+            "tier2": cls.NEO4J_ADMITTED,
+            "neo4j": cls.NEO4J_ADMITTED,
+            "neo4j_admitted": cls.NEO4J_ADMITTED,
+            cls.NEO4J_ADMITTED.value: cls.NEO4J_ADMITTED,
+        }
+        key = value.strip()
+        if key in mapping:
+            return mapping[key]
+        lowered = key.lower()
+        if lowered in mapping:
+            return mapping[lowered]
+        raise CapabilityValidationError(f"Unsupported trust tier: {value!r}")
+
 
 class ExecutionPosture(StrEnum):
     OBSERVE_ONLY = f"{BH_NS}ObserveOnly"
@@ -186,6 +206,8 @@ class HarnessDriver(Protocol):
 
     @property
     def driver_id(self) -> str: ...
+
+    def is_available(self) -> bool: ...
 
     def announce_capabilities_ttl(self) -> list[str]: ...
 

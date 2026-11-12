@@ -33,6 +33,28 @@ _TRUST_RANK: dict[TrustTier, int] = {
     TrustTier.NEO4J_ADMITTED: 2,
 }
 
+_VALID_JSON_TYPES = {"string", "boolean", "integer", "number", "array", "object"}
+_ALLOWED_SCHEMA_KEYS = {
+    "$schema",
+    "title",
+    "description",
+    "default",
+    "type",
+    "enum",
+    "const",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "items",
+    "properties",
+    "required",
+    "additionalProperties",
+}
+
 
 def _canonical_graph_sha256(graph: Graph) -> str:
     try:
@@ -47,6 +69,65 @@ def _canonical_graph_sha256(graph: Graph) -> str:
         )
         payload = "\n".join(nt_lines).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _is_strict_int(val: Any) -> bool:
+    return not isinstance(val, bool) and isinstance(val, int)
+
+
+def _is_strict_num(val: Any) -> bool:
+    return not isinstance(val, bool) and isinstance(val, (int, float))
+
+
+def _validate_schema_definition(schema: Any, path: str) -> None:
+    if not isinstance(schema, dict):
+        raise CapabilityValidationError(f"{path}: JSON Schema definition must be an object.")
+    unknown_keys = set(schema.keys()) - _ALLOWED_SCHEMA_KEYS
+    if unknown_keys:
+        raise CapabilityValidationError(
+            f"{path}: unsupported JSON Schema keywords {sorted(unknown_keys)!r} "
+            "(fail-closed contract validation)."
+        )
+    if "type" in schema and schema["type"] not in _VALID_JSON_TYPES:
+        raise CapabilityValidationError(f"{path}: unsupported JSON Schema type {schema['type']!r}.")
+    for int_kw in ("minLength", "maxLength", "minItems", "maxItems"):
+        if int_kw in schema and (not _is_strict_int(schema[int_kw]) or schema[int_kw] < 0):
+            raise CapabilityValidationError(f"{path}.{int_kw} must be a non-negative integer.")
+    for num_kw in ("minimum", "maximum"):
+        if num_kw in schema and not _is_strict_num(schema[num_kw]):
+            raise CapabilityValidationError(f"{path}.{num_kw} must be numeric.")
+    if "pattern" in schema:
+        if not isinstance(schema["pattern"], str):
+            raise CapabilityValidationError(f"{path}.pattern must be a string regex.")
+        try:
+            re.compile(schema["pattern"])
+        except re.error as exc:
+            raise CapabilityValidationError(f"{path}.pattern invalid regex: {exc}") from exc
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        raise CapabilityValidationError(f"{path}.enum must be a non-empty array.")
+    if "items" in schema:
+        _validate_schema_definition(schema["items"], f"{path}.items")
+    if "required" in schema:
+        if not isinstance(schema["required"], list) or not all(
+            isinstance(k, str) for k in schema["required"]
+        ):
+            raise CapabilityValidationError(f"{path}.required must be an array of strings.")
+    if "properties" in schema:
+        if not isinstance(schema["properties"], dict):
+            raise CapabilityValidationError(f"{path}.properties must be an object.")
+        for prop_k, prop_spec in schema["properties"].items():
+            _validate_schema_definition(prop_spec, f"{path}.properties.{prop_k}")
+    if "additionalProperties" in schema and not isinstance(
+        schema["additionalProperties"], (bool, dict)
+    ):
+        raise CapabilityValidationError(
+            f"{path}.additionalProperties must be a boolean or schema object."
+        )
+    if isinstance(schema.get("additionalProperties"), dict):
+        _validate_schema_definition(
+            schema["additionalProperties"],
+            f"{path}.additionalProperties",
+        )
 
 
 def parse_and_validate_capability_ttl(
@@ -89,8 +170,12 @@ def parse_and_validate_capability_ttl(
     descriptors: list[EndpointDescriptor] = []
 
     for ep_node in endpoint_nodes:
-        endpoint_id = str(data_graph.value(ep_node, BH.endpointId))
-        driver_id = str(data_graph.value(ep_node, BH.driverId))
+        ep_id_val = data_graph.value(ep_node, BH.endpointId)
+        drv_id_val = data_graph.value(ep_node, BH.driverId)
+        if ep_id_val is None or drv_id_val is None:
+            raise CapabilityValidationError("Endpoint missing endpointId or driverId.")
+        endpoint_id = str(ep_id_val)
+        driver_id = str(drv_id_val)
         label_val = data_graph.value(ep_node, RDFS.label)
         label = str(label_val) if label_val is not None else endpoint_id
 
@@ -130,14 +215,23 @@ def parse_and_validate_capability_ttl(
 
         models: list[ModelProfileDescriptor] = []
         for mp_node in data_graph.objects(ep_node, BH.hasModelProfile):
-            fam = str(data_graph.value(mp_node, BH.modelFamily))
-            ident = str(data_graph.value(mp_node, BH.modelIdentifier))
+            fam_val = data_graph.value(mp_node, BH.modelFamily)
+            ident_val = data_graph.value(mp_node, BH.modelIdentifier)
+            if fam_val is None or ident_val is None or not str(fam_val).strip():
+                raise CapabilityValidationError(
+                    f"ModelProfile on {endpoint_id!r} requires modelFamily and modelIdentifier."
+                )
             ctx_val = data_graph.value(mp_node, BH.contextWindowTokens)
-            ctx_int = int(str(ctx_val)) if ctx_val is not None else None
+            try:
+                ctx_int = int(str(ctx_val)) if ctx_val is not None else None
+            except ValueError as exc:
+                raise CapabilityValidationError(
+                    f"Invalid contextWindowTokens {ctx_val!r} on {endpoint_id!r}."
+                ) from exc
             models.append(
                 ModelProfileDescriptor(
-                    model_family=fam,
-                    model_identifier=ident,
+                    model_family=str(fam_val),
+                    model_identifier=str(ident_val),
                     context_window_tokens=ctx_int,
                 )
             )
@@ -145,28 +239,31 @@ def parse_and_validate_capability_ttl(
 
         facets: dict[str, CapabilityFacetDescriptor] = {}
         for fc_node in data_graph.objects(ep_node, BH.supportsFacet):
-            cap_iri = str(data_graph.value(fc_node, BH.forCapability))
+            cap_val = data_graph.value(fc_node, BH.forCapability)
+            key_val = data_graph.value(fc_node, BH.facetKey)
+            in_val = data_graph.value(fc_node, BH.inputJsonSchema)
+            if cap_val is None or key_val is None or in_val is None:
+                raise CapabilityValidationError(
+                    f"Incomplete CapabilityFacetContract on {endpoint_id!r}."
+                )
+            cap_iri = str(cap_val)
             if cap_iri not in capabilities:
                 raise CapabilityValidationError(
                     f"Endpoint {endpoint_id!r} declares facet contract for capability "
                     f"{cap_iri!r}, which is not in its bh:hasCapability set."
                 )
-            facet_key = str(data_graph.value(fc_node, BH.facetKey))
+            facet_key = str(key_val)
             if facet_key in facets:
                 raise CapabilityValidationError(
                     f"Duplicate facetKey {facet_key!r} on endpoint {endpoint_id!r}."
                 )
-            raw_in = str(data_graph.value(fc_node, BH.inputJsonSchema))
             try:
-                parsed_in = json.loads(raw_in)
+                parsed_in = json.loads(str(in_val))
             except json.JSONDecodeError as exc:
                 raise CapabilityValidationError(
                     f"Invalid inputJsonSchema on facet {facet_key!r}: {exc}"
                 ) from exc
-            if not isinstance(parsed_in, dict):
-                raise CapabilityValidationError(
-                    f"Facet {facet_key!r} inputJsonSchema must be a JSON object."
-                )
+            _validate_schema_definition(parsed_in, f"facet[{facet_key}].inputJsonSchema")
 
             raw_out_node = data_graph.value(fc_node, BH.outputJsonSchema)
             parsed_out: dict[str, Any] | None = None
@@ -177,10 +274,7 @@ def parse_and_validate_capability_ttl(
                     raise CapabilityValidationError(
                         f"Invalid outputJsonSchema on facet {facet_key!r}: {exc}"
                     ) from exc
-                if not isinstance(loaded_out, dict):
-                    raise CapabilityValidationError(
-                        f"Facet {facet_key!r} outputJsonSchema must be a JSON object."
-                    )
+                _validate_schema_definition(loaded_out, f"facet[{facet_key}].outputJsonSchema")
                 parsed_out = loaded_out
 
             facets[facet_key] = CapabilityFacetDescriptor(
@@ -242,6 +336,7 @@ def lift_legacy_beast_capabilities_to_ttl(
 
 
 def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+    _validate_schema_definition(schema, path)
     expected_type = schema.get("type")
     if expected_type is not None:
         if expected_type == "string":
@@ -255,13 +350,16 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -
             max_len = schema.get("maxLength")
             if max_len is not None and len(value) > int(max_len):
                 raise CapabilityValidationError(f"{path}: string exceeds maxLength={max_len}")
+            pat = schema.get("pattern")
+            if pat is not None and re.search(pat, value) is None:
+                raise CapabilityValidationError(f"{path}: string does not match pattern {pat!r}")
         elif expected_type == "boolean":
             if not isinstance(value, bool):
                 raise CapabilityValidationError(
                     f"{path}: expected boolean, got {type(value).__name__}"
                 )
         elif expected_type == "integer":
-            if isinstance(value, bool) or not isinstance(value, int):
+            if not _is_strict_int(value):
                 raise CapabilityValidationError(
                     f"{path}: expected integer, got {type(value).__name__}"
                 )
@@ -274,7 +372,7 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -
                     f"{path}: integer above maximum={schema['maximum']}"
                 )
         elif expected_type == "number":
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if not _is_strict_num(value):
                 raise CapabilityValidationError(
                     f"{path}: expected number, got {type(value).__name__}"
                 )
@@ -291,6 +389,10 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -
                 raise CapabilityValidationError(
                     f"{path}: fewer items than minItems={schema['minItems']}"
                 )
+            if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+                raise CapabilityValidationError(
+                    f"{path}: more items than maxItems={schema['maxItems']}"
+                )
             item_schema = schema.get("items")
             if isinstance(item_schema, dict):
                 for idx, item in enumerate(value):
@@ -305,7 +407,8 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -
                 if rk not in value:
                     raise CapabilityValidationError(f"{path}: missing required key {rk!r}")
             props = schema.get("properties", {})
-            if schema.get("additionalProperties") is False:
+            addl = schema.get("additionalProperties", True)
+            if addl is False:
                 extra = set(value.keys()) - set(props.keys())
                 if extra:
                     raise CapabilityValidationError(
@@ -314,9 +417,11 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -
             for prop_k, prop_v in value.items():
                 if prop_k in props and isinstance(props[prop_k], dict):
                     _validate_json_schema_value(prop_v, props[prop_k], f"{path}.{prop_k}")
-        else:
-            raise CapabilityValidationError(f"{path}: unsupported schema type {expected_type!r}")
+                elif isinstance(addl, dict):
+                    _validate_json_schema_value(prop_v, addl, f"{path}.{prop_k}")
 
+    if "const" in schema and value != schema["const"]:
+        raise CapabilityValidationError(f"{path}: value must equal {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
         raise CapabilityValidationError(f"{path}: value {value!r} not in enum {schema['enum']!r}")
 

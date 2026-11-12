@@ -213,3 +213,52 @@ def test_declarative_matching_and_ranking():
     )
     matched3 = match_and_rank_endpoints(endpoints, q3)
     assert [e.endpoint_id for e in matched3] == ["lean-prover-1", "cursor-cloud"]
+
+
+def test_shacl_rejects_untyped_blank_nodes_and_unknown_schema_keywords():
+    """Regression test for M-5, m-2, m-3: untyped blank nodes, schema keywords, SessionReceipt."""
+    ont_g = Graph()
+    ont_g.parse(data=read_capability_ontology_ttl(), format="turtle")
+    assert (BH.SessionReceipt, None, None) in ont_g
+    assert (BH.intendedAudience, None, None) in ont_g
+
+    # Untyped blank node on bh:hasModelProfile must fail SHACL (no silent "None" family)
+    untyped_mp_ttl = f"""\
+@prefix bh: <{BH_NS}> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<urn:beast:endpoint:bad-mp> a bh:AgentEndpoint ;
+    rdfs:label "Bad MP" ;
+    bh:endpointId "bad-mp" ;
+    bh:driverId "cursor-cloud" ;
+    bh:trustTier bh:RuntimeSelfAnnounced ;
+    bh:defaultPosture bh:ObserveOnly ;
+    bh:supportsPosture bh:ObserveOnly ;
+    bh:hasCapability bh:RepoFreePrompt ;
+    bh:hasModelProfile [ ] .
+"""
+    with pytest.raises(CapabilityValidationError):
+        parse_and_validate_capability_ttl(untyped_mp_ttl)
+
+    # Unknown JSON Schema keyword on facet contract must fail closed at announcement time
+    bad_schema_kw_ttl = f"""\
+@prefix bh: <{BH_NS}> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<urn:beast:endpoint:bad-kw> a bh:AgentEndpoint ;
+    rdfs:label "Bad Schema Keyword" ;
+    bh:endpointId "bad-kw" ;
+    bh:driverId "cursor-cloud" ;
+    bh:trustTier bh:RuntimeSelfAnnounced ;
+    bh:defaultPosture bh:ObserveOnly ;
+    bh:supportsPosture bh:ObserveOnly ;
+    bh:hasCapability bh:RepoFreePrompt ;
+    bh:supportsFacet [
+        a bh:CapabilityFacetContract ;
+        bh:forCapability bh:RepoFreePrompt ;
+        bh:facetKey "custom_opt" ;
+        bh:inputJsonSchema '{{"type": "string", "unsupportedVendorKeyword": true}}'
+    ] .
+"""
+    with pytest.raises(CapabilityValidationError):
+        parse_and_validate_capability_ttl(bad_schema_kw_ttl)

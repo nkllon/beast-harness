@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import uuid
 from pathlib import Path
@@ -13,9 +14,11 @@ from pydantic import BaseModel, create_model
 from beast_harness.secrets import ChainedSecretProvider
 from beast_harness.types import (
     BH_NS,
+    CapabilityValidationError,
     DriverRunResult,
     EndpointDescriptor,
     ExecutionPosture,
+    HarnessError,
     RunState,
     SessionRecord,
     VerifiedRepoRef,
@@ -23,28 +26,50 @@ from beast_harness.types import (
 )
 
 
-def _json_schema_to_pydantic_model(schema: dict[str, Any]) -> type[BaseModel]:
-    title = str(schema.get("title") or "StructuredHarnessResponse")
-    props = schema.get("properties", {})
+def _schema_node_to_py_type(prop_spec: dict[str, Any], model_prefix: str) -> Any:
+    raw_t = str(prop_spec.get("type", "string"))
+    if raw_t == "string":
+        return str
+    if raw_t == "boolean":
+        return bool
+    if raw_t == "integer":
+        return int
+    if raw_t == "number":
+        return float
+    if raw_t == "array":
+        item_spec = prop_spec.get("items")
+        if isinstance(item_spec, dict):
+            inner_t = _schema_node_to_py_type(item_spec, f"{model_prefix}Item")
+            return list[inner_t]  # type: ignore[valid-type]
+        return list[str]
+    if raw_t == "object":
+        return _json_schema_to_pydantic_model(prop_spec, default_title=model_prefix)
+    raise CapabilityValidationError(f"Unsupported structured_output_schema field type: {raw_t!r}.")
+
+
+def _json_schema_to_pydantic_model(
+    schema: dict[str, Any],
+    *,
+    default_title: str = "StructuredHarnessResponse",
+) -> type[BaseModel]:
+    title = str(schema.get("title") or default_title)
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        raise CapabilityValidationError(
+            f"structured_output_schema object {title!r} must declare non-empty 'properties'."
+        )
     required_set = set(schema.get("required", []))
-    type_map: dict[str, Any] = {
-        "string": str,
-        "boolean": bool,
-        "integer": int,
-        "number": float,
-        "array": list[Any],
-        "object": dict[str, Any],
-    }
     field_defs: dict[str, Any] = {}
     for prop_name, prop_spec in props.items():
-        raw_t = prop_spec.get("type", "string") if isinstance(prop_spec, dict) else "string"
-        py_t = type_map.get(str(raw_t), Any)
+        if not isinstance(prop_spec, dict):
+            raise CapabilityValidationError(
+                f"Property {prop_name!r} in {title!r} must be a schema object."
+            )
+        py_t = _schema_node_to_py_type(prop_spec, f"{title}_{prop_name}")
         if prop_name in required_set:
             field_defs[prop_name] = (py_t, ...)
         else:
             field_defs[prop_name] = (py_t | None, None)
-    if not field_defs:
-        field_defs["result"] = (str, ...)
     return create_model(title, **field_defs)
 
 
@@ -62,6 +87,12 @@ class AntigravitySdkDriver:
         self._state_root = Path(state_root)
         self._secret_key_name = secret_key_name
         self._runs: dict[str, DriverRunResult] = {}
+
+    def is_available(self) -> bool:
+        return (
+            importlib.util.find_spec("google.antigravity") is not None
+            and self._secrets.get_secret(self._secret_key_name) is not None
+        )
 
     def announce_capabilities_ttl(self) -> list[str]:
         effort_schema = json.dumps(
@@ -127,11 +158,17 @@ class AntigravitySdkDriver:
         facets: dict[str, Any],
         conversation_id: str | None = None,
         save_dir: str | None = None,
+        api_key: str | None = None,
     ) -> Any:
-        from google import antigravity as agy
-        from google.antigravity.hooks import policy as agy_policy
+        try:
+            from google import antigravity as agy
+            from google.antigravity.hooks import policy as agy_policy
+        except ImportError as exc:
+            raise HarnessError("google-antigravity extra is not installed.") from exc
 
-        api_key = self._secrets.get_secret(self._secret_key_name)
+        resolved_key = (
+            api_key if api_key is not None else self._secrets.get_secret(self._secret_key_name)
+        )
         workspaces = [workspace_path] if workspace_path else []
 
         if posture == ExecutionPosture.OBSERVE_ONLY:
@@ -175,14 +212,14 @@ class AntigravitySdkDriver:
 
         model_name = str(facets.get("model") or "gemini-2.5-pro")
         models_list: list[Any] | None = None
-        if "thinking_effort" in facets and api_key:
+        if "thinking_effort" in facets and resolved_key:
             level = agy.ThinkingLevel(str(facets["thinking_effort"]))
             models_list = [
                 agy.ModelTarget(
                     name=model_name,
                     types=[agy.ModelType.TEXT],
                     endpoint=agy.GeminiAPIEndpoint(
-                        api_key=api_key,
+                        api_key=resolved_key,
                         options=agy.GeminiModelOptions(thinking_level=level),
                     ),
                 )
@@ -202,8 +239,8 @@ class AntigravitySdkDriver:
             cfg_kwargs["models"] = models_list
         else:
             cfg_kwargs["model"] = model_name
-            if api_key:
-                cfg_kwargs["api_key"] = api_key
+            if resolved_key:
+                cfg_kwargs["api_key"] = resolved_key
 
         return agy.LocalAgentConfig(**cfg_kwargs)
 
@@ -216,9 +253,13 @@ class AntigravitySdkDriver:
         facets: dict[str, Any],
         prompt: str,
     ) -> DriverRunResult:
-        from google import antigravity as agy
+        try:
+            from google import antigravity as agy
+        except ImportError as exc:
+            raise HarnessError("google-antigravity extra is not installed.") from exc
 
-        self._secrets.require_secret(self._secret_key_name)
+        # Single secret lookup per turn (preserves single-use credential brokers)
+        api_key = self._secrets.require_secret(self._secret_key_name)
         save_dir = ensure_directory(self._state_root / conversation_id)
         cfg = self.build_local_agent_config(
             workspace_path=workspace_path,
@@ -226,6 +267,7 @@ class AntigravitySdkDriver:
             facets=facets,
             conversation_id=conversation_id,
             save_dir=str(save_dir),
+            api_key=api_key,
         )
 
         def _sync_run() -> tuple[str, dict[str, Any] | None]:
@@ -241,7 +283,13 @@ class AntigravitySdkDriver:
             return text, structured
 
         run_id = f"{conversation_id}-run-{uuid.uuid4().hex[:6]}"
-        answer, structured = await asyncio.to_thread(_sync_run)
+        try:
+            answer, structured = await asyncio.to_thread(_sync_run)
+        except Exception as exc:
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"AntigravitySdkDriver execution failed: {exc}") from exc
+
         result = DriverRunResult(
             native_agent_id=conversation_id,
             run_id=run_id,
@@ -264,12 +312,18 @@ class AntigravitySdkDriver:
     ) -> DriverRunResult:
         conv_id = f"agy-{uuid.uuid4().hex[:12]}"
         ws_path = repo_ref.local_worktree_path if repo_ref is not None else None
+        effective_prompt = prompt
+        if repo_ref is not None and repo_ref.base_sha:
+            effective_prompt = (
+                f"{prompt}\n\n[PINNED REPO CONTEXT: base_sha={repo_ref.base_sha} "
+                f"head_sha={repo_ref.commit_sha}]"
+            )
         return await self._execute_agent_turn(
             conversation_id=conv_id,
             workspace_path=ws_path,
             posture=posture,
             facets=facets,
-            prompt=prompt,
+            prompt=effective_prompt,
         )
 
     async def send_followup(

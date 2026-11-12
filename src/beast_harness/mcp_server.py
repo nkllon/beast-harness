@@ -15,7 +15,6 @@ from beast_harness.types import (
     SCHEMA_VERSION,
     DiscoveryQuery,
     ExecutionPosture,
-    HarnessError,
     TrustTier,
 )
 
@@ -55,7 +54,11 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
     ) -> str:
         """Discover registered SDK drivers and live Beast Network peers with full facet schemas."""
         try:
-            tier = TrustTier(min_trust_tier) if min_trust_tier else TrustTier.RUNTIME_SELF_ANNOUNCED
+            tier = (
+                TrustTier.from_shorthand(min_trust_tier)
+                if min_trust_tier
+                else TrustTier.RUNTIME_SELF_ANNOUNCED
+            )
             query = DiscoveryQuery(
                 required_capabilities=tuple(required_capabilities or ()),
                 preferred_capabilities=tuple(preferred_capabilities or ()),
@@ -66,7 +69,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
             )
             eps = await active_substrate.discover(query)
             return _ok({"endpoints": [ep.model_dump(mode="json") for ep in eps]})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -104,7 +107,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 independent_review=independent_review,
             )
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -121,7 +124,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 facets=facets,
             )
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -130,7 +133,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         try:
             session = await active_substrate.status(session_id)
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -142,7 +145,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 timeout_seconds=timeout_seconds,
             )
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -151,7 +154,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         try:
             session = await active_substrate.result(session_id)
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -160,7 +163,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         try:
             session = await active_substrate.cancel(session_id)
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     @mcp.tool()
@@ -191,7 +194,7 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 timeout_seconds=timeout_seconds,
             )
             return _ok({"session": session.model_dump(mode="json")})
-        except HarnessError as exc:
+        except Exception as exc:
             return _err(exc)
 
     return mcp

@@ -37,6 +37,17 @@ bh:TrustTier a owl:Class ;
 bh:ExecutionPosture a owl:Class ;
     rdfs:label "Execution Mutability Posture" .
 
+bh:SessionReceipt a owl:Class ;
+    rdfs:label "Durable Session & Audit Receipt" ;
+    rdfs:comment "Receipt binding session_id, endpoint_id, verified commit SHA, and SHA-256 audit digest." .
+
+# Ontology Metadata Properties
+bh:intendedAudience a owl:AnnotationProperty ;
+    rdfs:label "Intended Audience" .
+
+bh:schemaVersion a owl:DatatypeProperty ;
+    rdfs:range xsd:string .
+
 # Trust Tier Individuals
 bh:RuntimeSelfAnnounced a bh:TrustTier ;
     rdfs:label "Tier 1: Runtime Self-Announced (Ad-hoc MCP & Beast Bus)" .
@@ -172,4 +183,16 @@ bh:inputJsonSchema a owl:DatatypeProperty ;
 
 bh:outputJsonSchema a owl:DatatypeProperty ;
     rdfs:domain bh:CapabilityFacetContract ;
+    rdfs:range xsd:string .
+
+bh:sessionId a owl:DatatypeProperty ;
+    rdfs:domain bh:SessionReceipt ;
+    rdfs:range xsd:string .
+
+bh:verifiedCommitSha a owl:DatatypeProperty ;
+    rdfs:domain bh:SessionReceipt ;
+    rdfs:range xsd:string .
+
+bh:auditDigest a owl:DatatypeProperty ;
+    rdfs:domain bh:SessionReceipt ;
     rdfs:range xsd:string .

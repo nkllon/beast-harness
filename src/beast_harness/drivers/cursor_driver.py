@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import time
 import uuid
@@ -27,6 +28,18 @@ _OBSERVE_GUARDRAIL = (
     "\n\n[OBSERVE_ONLY GUARDRAIL: Inspect the repository at the pinned commit only. "
     "Do NOT create branches, commit changes, push refs, or open pull requests.]"
 )
+
+
+def _format_repo_context_suffix(repo_ref: VerifiedRepoRef | None) -> str:
+    if repo_ref is None:
+        return ""
+    if repo_ref.base_sha:
+        return (
+            f"\n\n[PINNED REPO CONTEXT: repo={repo_ref.repo_url} "
+            f"base_sha={repo_ref.base_sha} head_sha={repo_ref.commit_sha} "
+            f"(diff range: {repo_ref.base_sha}..{repo_ref.commit_sha})]"
+        )
+    return f"\n\n[PINNED REPO CONTEXT: repo={repo_ref.repo_url} commit_sha={repo_ref.commit_sha}]"
 
 
 def _map_cursor_status(raw: str) -> RunState:
@@ -61,6 +74,9 @@ class CursorCloudDriver:
         self._base_url = base_url.rstrip("/")
         self._http_client = http_client
         self._secret_key_name = secret_key_name
+
+    def is_available(self) -> bool:
+        return self._secrets.get_secret(self._secret_key_name) is not None
 
     def announce_capabilities_ttl(self) -> list[str]:
         extra_repos_schema = json.dumps(
@@ -147,16 +163,21 @@ class CursorCloudDriver:
         timeout: float = 30.0,
     ) -> httpx.Response:
         headers = self._auth_headers()
-        if self._http_client is not None:
-            return await self._http_client.request(
-                method,
-                path,
-                headers=headers,
-                json=json_body,
-                timeout=timeout,
-            )
-        async with httpx.AsyncClient(base_url=self._base_url, timeout=timeout) as client:
-            return await client.request(method, path, headers=headers, json=json_body)
+        try:
+            if self._http_client is not None:
+                return await self._http_client.request(
+                    method,
+                    path,
+                    headers=headers,
+                    json=json_body,
+                    timeout=timeout,
+                )
+            async with httpx.AsyncClient(base_url=self._base_url, timeout=timeout) as client:
+                return await client.request(method, path, headers=headers, json=json_body)
+        except httpx.HTTPError as exc:
+            raise HarnessError(
+                f"Cursor Cloud HTTP transport error on {method} {path}: {exc}"
+            ) from exc
 
     async def start_run(
         self,
@@ -173,15 +194,16 @@ class CursorCloudDriver:
                 "Facet 'allow_pr=True' requires posture IsolatedBranchWrite."
             )
 
-        effective_prompt = (
-            f"{prompt}{_OBSERVE_GUARDRAIL}"
-            if (posture == ExecutionPosture.OBSERVE_ONLY or independent_review)
-            else prompt
-        )
+        effective_prompt = f"{prompt}{_format_repo_context_suffix(repo_ref)}"
+        if posture == ExecutionPosture.OBSERVE_ONLY or independent_review:
+            effective_prompt = f"{effective_prompt}{_OBSERVE_GUARDRAIL}"
 
         repos: list[dict[str, str]] = []
         if repo_ref is not None:
-            repos.append({"url": repo_ref.repo_url, "ref": repo_ref.commit_sha})
+            repo_entry: dict[str, str] = {"url": repo_ref.repo_url, "ref": repo_ref.commit_sha}
+            if repo_ref.base_sha:
+                repo_entry["baseRef"] = repo_ref.base_sha
+            repos.append(repo_entry)
         for extra in facets.get("extra_repos", []):
             repos.append({"url": str(extra["url"]), "ref": str(extra["ref"])})
 
@@ -209,15 +231,30 @@ class CursorCloudDriver:
         data = resp.json()
         agent_obj = data.get("agent", data)
         run_obj = data.get("run", data)
-        agent_id = str(agent_obj.get("id") or data.get("id"))
-        run_id = str(run_obj.get("runId") or agent_obj.get("latestRunId") or f"{agent_id}-run-1")
-        raw_status = str(run_obj.get("status") or agent_obj.get("status") or "running")
-        steps = list(run_obj.get("steps") or [])
+        raw_agent_id = agent_obj.get("id") if isinstance(agent_obj, dict) else None
+        if not raw_agent_id:
+            raw_agent_id = data.get("id")
+        if not raw_agent_id or not str(raw_agent_id).strip():
+            raise HarnessError("Cursor Cloud response did not include a valid agent id.")
+        agent_id = str(raw_agent_id).strip()
+
+        run_id = str(
+            (run_obj.get("runId") if isinstance(run_obj, dict) else None)
+            or (agent_obj.get("latestRunId") if isinstance(agent_obj, dict) else None)
+            or f"{agent_id}-run-1"
+        )
+        raw_status = str(
+            (run_obj.get("status") if isinstance(run_obj, dict) else None)
+            or (agent_obj.get("status") if isinstance(agent_obj, dict) else None)
+            or "running"
+        )
+        steps = list((run_obj.get("steps") if isinstance(run_obj, dict) else None) or [])
         return DriverRunResult(
             native_agent_id=agent_id,
             run_id=run_id,
             state=_map_cursor_status(raw_status),
-            answer=run_obj.get("output") or data.get("output"),
+            answer=(run_obj.get("output") if isinstance(run_obj, dict) else None)
+            or data.get("output"),
             audit_events=steps,
         )
 
@@ -393,6 +430,12 @@ class CursorLocalDriver:
         self._secret_key_name = secret_key_name
         self._runs: dict[str, DriverRunResult] = {}
 
+    def is_available(self) -> bool:
+        return (
+            importlib.util.find_spec("cursor_sdk") is not None
+            and self._secrets.get_secret(self._secret_key_name) is not None
+        )
+
     def announce_capabilities_ttl(self) -> list[str]:
         str_schema = json.dumps({"type": "string", "minLength": 1})
         ttl = f"""\
@@ -401,7 +444,7 @@ class CursorLocalDriver:
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
 <urn:beast:endpoint:cursor-local> a bh:AgentEndpoint ;
-    rdfs:label "Cursor Local SDK Agent (Read-Only Detached Worktree)" ;
+    rdfs:label "Cursor Local SDK Agent (Detached Worktree)" ;
     bh:endpointId "cursor-local" ;
     bh:driverId "cursor-local" ;
     bh:trustTier bh:RuntimeSelfAnnounced ;
@@ -437,15 +480,17 @@ class CursorLocalDriver:
         facets: dict[str, Any],
         independent_review: bool,
     ) -> DriverRunResult:
-        import cursor_sdk
+        try:
+            import cursor_sdk
+        except ImportError as exc:
+            raise HarnessError("cursor-sdk extra is not installed.") from exc
 
         api_key = self._secrets.require_secret(self._secret_key_name)
         cwd = repo_ref.local_worktree_path if repo_ref is not None else None
-        effective_prompt = (
-            f"{prompt}{_OBSERVE_GUARDRAIL}"
-            if (posture == ExecutionPosture.OBSERVE_ONLY or independent_review)
-            else prompt
-        )
+        effective_prompt = f"{prompt}{_format_repo_context_suffix(repo_ref)}"
+        if posture == ExecutionPosture.OBSERVE_ONLY or independent_review:
+            effective_prompt = f"{effective_prompt}{_OBSERVE_GUARDRAIL}"
+
         client = cursor_sdk.AsyncClient(api_key=api_key)
         try:
             agent = await cursor_sdk.AsyncAgent.create(
@@ -466,6 +511,10 @@ class CursorLocalDriver:
             )
             self._runs[run_id] = result
             return result
+        except Exception as exc:
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"CursorLocalDriver start_run failed: {exc}") from exc
         finally:
             await client.close()
 
@@ -476,13 +525,32 @@ class CursorLocalDriver:
         prompt: str,
         facets: dict[str, Any],
     ) -> DriverRunResult:
-        import cursor_sdk
+        try:
+            import cursor_sdk
+        except ImportError as exc:
+            raise HarnessError("cursor-sdk extra is not installed.") from exc
 
         api_key = self._secrets.require_secret(self._secret_key_name)
+        effective_prompt = (
+            f"{prompt}{_OBSERVE_GUARDRAIL}"
+            if session.posture == ExecutionPosture.OBSERVE_ONLY
+            else prompt
+        )
+        merged_model = facets.get("model") or session.facets.get("model")
+        resume_opts: dict[str, Any] = {}
+        if merged_model:
+            resume_opts["model"] = merged_model
+        if session.worktree_path:
+            resume_opts["local"] = cursor_sdk.LocalAgentOptions(cwd=session.worktree_path)
+
         client = cursor_sdk.AsyncClient(api_key=api_key)
         try:
-            agent = await cursor_sdk.AsyncAgent.resume(session.native_agent_id, client=client)
-            run_res = await agent.prompt(prompt)
+            agent = await cursor_sdk.AsyncAgent.resume(
+                session.native_agent_id,
+                options=resume_opts or None,
+                client=client,
+            )
+            run_res = await agent.prompt(effective_prompt)
             run_id = f"{session.native_agent_id}-run-{uuid.uuid4().hex[:6]}"
             result = DriverRunResult(
                 native_agent_id=session.native_agent_id,
@@ -492,6 +560,10 @@ class CursorLocalDriver:
             )
             self._runs[run_id] = result
             return result
+        except Exception as exc:
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"CursorLocalDriver send_followup failed: {exc}") from exc
         finally:
             await client.close()
 
