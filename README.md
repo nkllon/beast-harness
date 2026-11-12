@@ -6,7 +6,7 @@ Capability-modeled multi-agent execution substrate, MCP server, and Beast Networ
 
 ## Overview
 
-`beast-harness` decouples heterogeneous agent environments (Cursor Cloud Agents & `cursor-sdk`, Google Antigravity SDK, and live Beast Network peers) behind a shared session lifecycle (`session_id`, `run_id`, `status`, `answer`, `cancel`) while preserving **every harness's unique native capabilities** via SHACL-validated Turtle capability graphs and typed JSON-Schema facets.
+`beast-harness` decouples heterogeneous agent environments (Cursor Cloud Agents & `cursor-sdk`, Google Antigravity SDK, Anthropic Managed Agents & `claude-agent-sdk`, OpenAI Codex App-Server JSON-RPC, and live Beast Network peers) behind a shared session lifecycle (`session_id`, `run_id`, `status`, `answer`, `cancel`) while preserving **every harness's unique native capabilities** via SHACL-validated Turtle capability graphs, cost/latency ranking profiles, and typed JSON-Schema facets.
 
 ## Installation
 

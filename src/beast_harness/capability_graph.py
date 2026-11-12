@@ -17,11 +17,14 @@ from beast_harness.types import (
     BH_NS,
     CapabilityFacetDescriptor,
     CapabilityValidationError,
+    CostTier,
     DiscoveryQuery,
     EndpointDescriptor,
     ExecutionPosture,
+    LatencyClass,
     ModelProfileDescriptor,
     PostureViolationError,
+    RankingProfile,
     TrustTier,
     normalize_capability_iri,
 )
@@ -31,6 +34,18 @@ BH = Namespace(BH_NS)
 _TRUST_RANK: dict[TrustTier, int] = {
     TrustTier.RUNTIME_SELF_ANNOUNCED: 1,
     TrustTier.NEO4J_ADMITTED: 2,
+}
+
+_COST_RANK: dict[CostTier, int] = {
+    CostTier.LOW: 1,
+    CostTier.MEDIUM: 2,
+    CostTier.HIGH: 3,
+}
+
+_LATENCY_RANK: dict[LatencyClass, int] = {
+    LatencyClass.INTERACTIVE: 1,
+    LatencyClass.BATCH: 2,
+    LatencyClass.CLOUD_CONTAINER: 3,
 }
 
 _VALID_JSON_TYPES = {"string", "boolean", "integer", "number", "array", "object"}
@@ -284,6 +299,12 @@ def parse_and_validate_capability_ttl(
                 output_json_schema=parsed_out,
             )
 
+        cost_raw = data_graph.value(ep_node, BH.costTier)
+        cost_tier = CostTier.from_shorthand(str(cost_raw)) if cost_raw is not None else None
+
+        lat_raw = data_graph.value(ep_node, BH.latencyClass)
+        latency_class = LatencyClass.from_shorthand(str(lat_raw)) if lat_raw is not None else None
+
         descriptors.append(
             EndpointDescriptor(
                 endpoint_iri=str(ep_node),
@@ -297,6 +318,8 @@ def parse_and_validate_capability_ttl(
                 legacy_capability_tags=legacy_tags,
                 models=tuple(models),
                 facets=facets,
+                cost_tier=cost_tier,
+                latency_class=latency_class,
                 alive=alive,
                 capability_graph_digest=digest,
             )
@@ -461,7 +484,7 @@ def match_and_rank_endpoints(
     excluded_families = {fam.strip().lower() for fam in query.exclude_model_families if fam.strip()}
     min_rank = _TRUST_RANK[query.min_trust_tier]
 
-    candidates: list[tuple[tuple[int, int, str], EndpointDescriptor]] = []
+    candidates: list[tuple[tuple[int, ...], str, EndpointDescriptor]] = []
     for ep in endpoints:
         if query.only_alive and not ep.alive:
             continue
@@ -469,6 +492,15 @@ def match_and_rank_endpoints(
             continue
         if query.required_posture not in ep.supported_postures:
             continue
+        if query.max_cost_tier is not None:
+            if ep.cost_tier is None or _COST_RANK[ep.cost_tier] > _COST_RANK[query.max_cost_tier]:
+                continue
+        if query.max_latency_class is not None:
+            if (
+                ep.latency_class is None
+                or _LATENCY_RANK[ep.latency_class] > _LATENCY_RANK[query.max_latency_class]
+            ):
+                continue
         if excluded_families and any(
             m.model_family.strip().lower() in excluded_families for m in ep.models
         ):
@@ -479,8 +511,33 @@ def match_and_rank_endpoints(
         pref_score = sum(
             1 for pref in query.preferred_capabilities if _endpoint_matches_capability(ep, pref)
         )
-        sort_key = (-pref_score, -_TRUST_RANK[ep.trust_tier], ep.endpoint_id)
-        candidates.append((sort_key, ep))
+        trust_score = _TRUST_RANK[ep.trust_tier]
+        default_missing = (
+            4
+            if query.ranking_profile in {RankingProfile.LOW_COST, RankingProfile.LOW_LATENCY}
+            else 2
+        )
+        cost_rank = _COST_RANK[ep.cost_tier] if ep.cost_tier is not None else default_missing
+        latency_rank = (
+            _LATENCY_RANK[ep.latency_class] if ep.latency_class is not None else default_missing
+        )
 
-    candidates.sort(key=lambda item: item[0])
-    return [ep for _key, ep in candidates]
+        if query.ranking_profile == RankingProfile.LOW_COST:
+            rank_tuple: tuple[int, ...] = (-trust_score, cost_rank, -pref_score, latency_rank)
+        elif query.ranking_profile == RankingProfile.LOW_LATENCY:
+            rank_tuple = (-trust_score, latency_rank, -pref_score, cost_rank)
+        elif query.ranking_profile == RankingProfile.CAPABILITY_FIRST:
+            rank_tuple = (
+                -pref_score,
+                -len(ep.capabilities),
+                -trust_score,
+                cost_rank,
+                latency_rank,
+            )
+        else:
+            rank_tuple = (-pref_score, -trust_score, cost_rank, latency_rank)
+
+        candidates.append((rank_tuple, ep.endpoint_id, ep))
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [ep for _rank, _eid, ep in candidates]

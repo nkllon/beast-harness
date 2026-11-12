@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
+import shutil
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -103,6 +107,8 @@ class CursorCloudDriver:
     rdfs:label "Cursor Cloud Agent (v1 REST + SSE)" ;
     bh:endpointId "cursor-cloud" ;
     bh:driverId "cursor-cloud" ;
+    bh:costTier "medium" ;
+    bh:latencyClass "cloud-container" ;
     bh:trustTier bh:RuntimeSelfAnnounced ;
     bh:defaultPosture bh:ObserveOnly ;
     bh:supportsPosture bh:ObserveOnly, bh:ProposeDiff, bh:IsolatedBranchWrite ;
@@ -425,15 +431,19 @@ class CursorLocalDriver:
         *,
         secrets: ChainedSecretProvider,
         secret_key_name: str = "CURSOR_API_KEY",
+        cli_binary: str = "cursor-agent",
     ) -> None:
         self._secrets = secrets
         self._secret_key_name = secret_key_name
+        self._cli_binary = cli_binary
         self._runs: dict[str, DriverRunResult] = {}
 
     def is_available(self) -> bool:
-        return importlib.util.find_spec("cursor_sdk") is not None and self._secrets.has_secret(
-            self._secret_key_name
+        has_runtime = shutil.which(self._cli_binary) is not None or (
+            importlib.util.find_spec("cursor_sdk") is not None
+            and shutil.which("cursor-sdk-bridge") is not None
         )
+        return has_runtime and self._secrets.has_secret(self._secret_key_name)
 
     def announce_capabilities_ttl(self) -> list[str]:
         str_schema = json.dumps({"type": "string", "minLength": 1})
@@ -446,6 +456,8 @@ class CursorLocalDriver:
     rdfs:label "Cursor Local SDK Agent (Detached Worktree)" ;
     bh:endpointId "cursor-local" ;
     bh:driverId "cursor-local" ;
+    bh:costTier "low" ;
+    bh:latencyClass "interactive" ;
     bh:trustTier bh:RuntimeSelfAnnounced ;
     bh:defaultPosture bh:ObserveOnly ;
     bh:supportsPosture bh:ObserveOnly, bh:ProposeDiff ;
@@ -469,6 +481,94 @@ class CursorLocalDriver:
 """
         return [ttl]
 
+    async def _run_via_cli(
+        self,
+        *,
+        api_key: str,
+        prompt: str,
+        cwd: str | None,
+        posture: ExecutionPosture,
+        model: str | None,
+        resume_chat_id: str | None,
+    ) -> DriverRunResult:
+        cli_path = shutil.which(self._cli_binary)
+        if cli_path is None:
+            raise HarnessError(f"Cursor CLI {self._cli_binary!r} not found on PATH.")
+
+        scratch: tempfile.TemporaryDirectory[str] | None = None
+        if cwd is not None:
+            effective_cwd = str(Path(cwd).resolve())
+        else:
+            scratch = tempfile.TemporaryDirectory(prefix="cursor-repofree-")
+            effective_cwd = str(Path(scratch.name).resolve())
+
+        env = dict(os.environ)
+        env["CURSOR_API_KEY"] = api_key
+
+        cmd: list[str] = [
+            cli_path,
+            "--print",
+            "--output-format",
+            "json",
+            "--sandbox",
+            "enabled",
+            "--trust",
+            "--skip-worktree-setup",
+            "--workspace",
+            effective_cwd,
+        ]
+        if posture == ExecutionPosture.OBSERVE_ONLY:
+            cmd.extend(["--mode", "ask"])
+        if model:
+            cmd.extend(["--model", str(model)])
+        if resume_chat_id:
+            cmd.extend(["--resume", resume_chat_id])
+        cmd.extend(["--", prompt])
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=effective_cwd,
+                env=env,
+            )
+            stdout_b, stderr_b = await proc.communicate()
+        finally:
+            if scratch is not None:
+                scratch.cleanup()
+
+        stdout_txt = stdout_b.decode("utf-8", errors="replace").strip()
+        stderr_txt = stderr_b.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            raise HarnessError(
+                f"cursor-agent exited with code {proc.returncode}: {stderr_txt or stdout_txt}"
+            )
+
+        agent_id = resume_chat_id or f"cursor-local-{uuid.uuid4().hex[:10]}"
+        answer = stdout_txt
+        try:
+            parsed = json.loads(stdout_txt)
+            if isinstance(parsed, dict):
+                agent_id = str(
+                    parsed.get("session_id") or parsed.get("chatId") or parsed.get("id") or agent_id
+                )
+                answer = str(
+                    parsed.get("result") or parsed.get("text") or parsed.get("output") or stdout_txt
+                )
+        except json.JSONDecodeError:
+            pass
+
+        run_id = f"{agent_id}-run-{uuid.uuid4().hex[:6]}"
+        result = DriverRunResult(
+            native_agent_id=agent_id,
+            run_id=run_id,
+            state=RunState.FINISHED,
+            answer=answer,
+        )
+        self._runs[run_id] = result
+        return result
+
     async def start_run(
         self,
         *,
@@ -479,18 +579,29 @@ class CursorLocalDriver:
         facets: dict[str, Any],
         independent_review: bool,
     ) -> DriverRunResult:
-        try:
-            import cursor_sdk
-        except ImportError as exc:
-            raise HarnessError("cursor-sdk extra is not installed.") from exc
-
         api_key = self._secrets.require_secret(self._secret_key_name)
         cwd = repo_ref.local_worktree_path if repo_ref is not None else None
         effective_prompt = f"{prompt}{_format_repo_context_suffix(repo_ref)}"
         if posture == ExecutionPosture.OBSERVE_ONLY or independent_review:
             effective_prompt = f"{effective_prompt}{_OBSERVE_GUARDRAIL}"
 
-        client = cursor_sdk.AsyncClient(api_key=api_key)
+        if shutil.which("cursor-sdk-bridge") is None and shutil.which(self._cli_binary) is not None:
+            return await self._run_via_cli(
+                api_key=api_key,
+                prompt=effective_prompt,
+                cwd=cwd,
+                posture=posture,
+                model=facets.get("model"),
+                resume_chat_id=None,
+            )
+
+        try:
+            import cursor_sdk
+        except ImportError as exc:
+            raise HarnessError("cursor-sdk extra is not installed.") from exc
+
+        bridge = await cursor_sdk.AsyncBridge.launch(workspace=cwd)
+        client = cursor_sdk.AsyncClient(bridge.endpoint, auth_token=api_key)
         try:
             agent = await cursor_sdk.AsyncAgent.create(
                 client=client,
@@ -516,6 +627,7 @@ class CursorLocalDriver:
             raise HarnessError(f"CursorLocalDriver start_run failed: {exc}") from exc
         finally:
             await client.close()
+            await bridge.aclose()
 
     async def send_followup(
         self,
@@ -524,11 +636,6 @@ class CursorLocalDriver:
         prompt: str,
         facets: dict[str, Any],
     ) -> DriverRunResult:
-        try:
-            import cursor_sdk
-        except ImportError as exc:
-            raise HarnessError("cursor-sdk extra is not installed.") from exc
-
         api_key = self._secrets.require_secret(self._secret_key_name)
         effective_prompt = (
             f"{prompt}{_OBSERVE_GUARDRAIL}"
@@ -536,13 +643,30 @@ class CursorLocalDriver:
             else prompt
         )
         merged_model = facets.get("model") or session.facets.get("model")
+
+        if shutil.which("cursor-sdk-bridge") is None and shutil.which(self._cli_binary) is not None:
+            return await self._run_via_cli(
+                api_key=api_key,
+                prompt=effective_prompt,
+                cwd=session.worktree_path,
+                posture=session.posture,
+                model=merged_model,
+                resume_chat_id=session.native_agent_id,
+            )
+
+        try:
+            import cursor_sdk
+        except ImportError as exc:
+            raise HarnessError("cursor-sdk extra is not installed.") from exc
+
         resume_opts: dict[str, Any] = {}
         if merged_model:
             resume_opts["model"] = merged_model
         if session.worktree_path:
             resume_opts["local"] = cursor_sdk.LocalAgentOptions(cwd=session.worktree_path)
 
-        client = cursor_sdk.AsyncClient(api_key=api_key)
+        bridge = await cursor_sdk.AsyncBridge.launch(workspace=session.worktree_path)
+        client = cursor_sdk.AsyncClient(bridge.endpoint, auth_token=api_key)
         try:
             agent = await cursor_sdk.AsyncAgent.resume(
                 session.native_agent_id,
@@ -565,6 +689,7 @@ class CursorLocalDriver:
             raise HarnessError(f"CursorLocalDriver send_followup failed: {exc}") from exc
         finally:
             await client.close()
+            await bridge.aclose()
 
     async def poll_run(self, *, session: SessionRecord) -> DriverRunResult:
         if session.latest_run_id in self._runs:

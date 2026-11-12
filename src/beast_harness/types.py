@@ -9,7 +9,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.2.0"
 BH_NS = "https://nkllon.com/ontology/beast-harness#"
 
 
@@ -100,6 +100,57 @@ class RunState(StrEnum):
         return self in {self.FINISHED, self.ERROR, self.CANCELLED}
 
 
+class CostTier(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+    @classmethod
+    def from_shorthand(cls, value: str) -> CostTier:
+        lowered = value.strip().lower()
+        for member in cls:
+            if lowered == member.value:
+                return member
+        raise CapabilityValidationError(
+            f"Unsupported cost tier {value!r} (expected one of: low, medium, high)."
+        )
+
+
+class LatencyClass(StrEnum):
+    INTERACTIVE = "interactive"
+    BATCH = "batch"
+    CLOUD_CONTAINER = "cloud-container"
+
+    @classmethod
+    def from_shorthand(cls, value: str) -> LatencyClass:
+        lowered = value.strip().lower().replace("_", "-")
+        for member in cls:
+            if lowered == member.value:
+                return member
+        raise CapabilityValidationError(
+            f"Unsupported latency class {value!r} "
+            "(expected one of: interactive, batch, cloud-container)."
+        )
+
+
+class RankingProfile(StrEnum):
+    BALANCED = "balanced"
+    CAPABILITY_FIRST = "capability_first"
+    LOW_COST = "low_cost"
+    LOW_LATENCY = "low_latency"
+
+    @classmethod
+    def from_shorthand(cls, value: str) -> RankingProfile:
+        lowered = value.strip().lower().replace("-", "_")
+        for member in cls:
+            if lowered == member.value:
+                return member
+        raise CapabilityValidationError(
+            f"Unsupported ranking_profile {value!r} "
+            "(expected one of: balanced, capability_first, low_cost, low_latency)."
+        )
+
+
 class VerifiedRepoRef(BaseModel):
     """Immutable, remote-verified repository reference."""
 
@@ -145,6 +196,8 @@ class EndpointDescriptor(BaseModel):
     legacy_capability_tags: tuple[str, ...] = ()
     models: tuple[ModelProfileDescriptor, ...] = ()
     facets: dict[str, CapabilityFacetDescriptor] = Field(default_factory=dict)
+    cost_tier: CostTier | None = None
+    latency_class: LatencyClass | None = None
     alive: bool = True
     capability_graph_digest: str = ""
 
@@ -157,6 +210,9 @@ class DiscoveryQuery(BaseModel):
     exclude_model_families: tuple[str, ...] = ()
     min_trust_tier: TrustTier = TrustTier.RUNTIME_SELF_ANNOUNCED
     required_posture: ExecutionPosture = ExecutionPosture.OBSERVE_ONLY
+    ranking_profile: RankingProfile = RankingProfile.BALANCED
+    max_cost_tier: CostTier | None = None
+    max_latency_class: LatencyClass | None = None
     only_alive: bool = True
 
 

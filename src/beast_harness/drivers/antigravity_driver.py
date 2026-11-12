@@ -111,6 +111,8 @@ class AntigravitySdkDriver:
     rdfs:label "Google Antigravity SDK Local Agent (Policy-Hooked)" ;
     bh:endpointId "antigravity-sdk" ;
     bh:driverId "antigravity-sdk" ;
+    bh:costTier "medium" ;
+    bh:latencyClass "interactive" ;
     bh:trustTier bh:RuntimeSelfAnnounced ;
     bh:defaultPosture bh:ObserveOnly ;
     bh:supportsPosture bh:ObserveOnly, bh:ProposeDiff ;

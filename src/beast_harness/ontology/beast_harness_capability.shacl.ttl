@@ -59,6 +59,20 @@ bh:AgentEndpointShape a sh:NodeShape ;
         sh:node bh:CapabilityFacetContractShape ;
         sh:message "Every bh:supportsFacet node must conform to bh:CapabilityFacetContractShape." ;
     ] ;
+    sh:property [
+        sh:path bh:costTier ;
+        sh:datatype xsd:string ;
+        sh:maxCount 1 ;
+        sh:in ( "low" "medium" "high" ) ;
+        sh:message "AgentEndpoint bh:costTier must be at most one of: low, medium, high." ;
+    ] ;
+    sh:property [
+        sh:path bh:latencyClass ;
+        sh:datatype xsd:string ;
+        sh:maxCount 1 ;
+        sh:in ( "interactive" "batch" "cloud-container" ) ;
+        sh:message "AgentEndpoint bh:latencyClass must be at most one of: interactive, batch, cloud-container." ;
+    ] ;
     sh:or (
         [
             sh:property [

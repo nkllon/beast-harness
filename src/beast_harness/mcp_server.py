@@ -13,8 +13,11 @@ except ImportError:
 from beast_harness.substrate import HarnessSubstrate, create_default_substrate
 from beast_harness.types import (
     SCHEMA_VERSION,
+    CostTier,
     DiscoveryQuery,
     ExecutionPosture,
+    LatencyClass,
+    RankingProfile,
     TrustTier,
 )
 
@@ -50,6 +53,9 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         exclude_model_families: list[str] | None = None,
         min_trust_tier: str | None = None,
         required_posture: str = "observe_only",
+        ranking_profile: str = "balanced",
+        max_cost_tier: str | None = None,
+        max_latency_class: str | None = None,
         only_alive: bool = True,
     ) -> str:
         """Discover registered SDK drivers and live Beast Network peers with full facet schemas."""
@@ -65,6 +71,11 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 exclude_model_families=tuple(exclude_model_families or ()),
                 min_trust_tier=tier,
                 required_posture=ExecutionPosture.from_shorthand(required_posture),
+                ranking_profile=RankingProfile.from_shorthand(ranking_profile),
+                max_cost_tier=CostTier.from_shorthand(max_cost_tier) if max_cost_tier else None,
+                max_latency_class=(
+                    LatencyClass.from_shorthand(max_latency_class) if max_latency_class else None
+                ),
                 only_alive=only_alive,
             )
             eps = await active_substrate.discover(query)
@@ -82,6 +93,9 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         required_capabilities: list[str] | None = None,
         preferred_capabilities: list[str] | None = None,
         exclude_model_families: list[str] | None = None,
+        ranking_profile: str = "balanced",
+        max_cost_tier: str | None = None,
+        max_latency_class: str | None = None,
         posture: str = "observe_only",
         facets: dict[str, Any] | None = None,
         independent_review: bool = False,
@@ -94,6 +108,11 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 preferred_capabilities=tuple(preferred_capabilities or ()),
                 exclude_model_families=tuple(exclude_model_families or ()),
                 required_posture=resolved_posture,
+                ranking_profile=RankingProfile.from_shorthand(ranking_profile),
+                max_cost_tier=CostTier.from_shorthand(max_cost_tier) if max_cost_tier else None,
+                max_latency_class=(
+                    LatencyClass.from_shorthand(max_latency_class) if max_latency_class else None
+                ),
             )
             session = await active_substrate.start(
                 prompt=prompt,
@@ -176,6 +195,9 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
         required_capabilities: list[str] | None = None,
         preferred_capabilities: list[str] | None = None,
         exclude_model_families: list[str] | None = None,
+        ranking_profile: str = "balanced",
+        max_cost_tier: str | None = None,
+        max_latency_class: str | None = None,
         facets: dict[str, Any] | None = None,
         timeout_seconds: float = 300.0,
     ) -> str:
@@ -190,6 +212,9 @@ def build_mcp_server(substrate: HarnessSubstrate | None = None):
                 required_capabilities=tuple(required_capabilities or ()),
                 preferred_capabilities=tuple(preferred_capabilities or ()),
                 exclude_model_families=tuple(exclude_model_families or ()),
+                ranking_profile=ranking_profile,
+                max_cost_tier=max_cost_tier,
+                max_latency_class=max_latency_class,
                 facets=facets,
                 timeout_seconds=timeout_seconds,
             )

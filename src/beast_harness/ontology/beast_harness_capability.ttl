@@ -7,7 +7,7 @@
 
 <https://nkllon.com/ontology/beast-harness> a owl:Ontology ;
     rdfs:label "Beast Harness Non-LCD Agent & Capability Ontology" ;
-    bh:schemaVersion "0.1.0" ;
+    bh:schemaVersion "0.2.0" ;
     bh:intendedAudience
         "LLM calling agents inspecting runtime capability facets via MCP or Beast Network",
         "Deterministic SHACL/RDF routers and Casper closeout verifiers",
@@ -154,6 +154,16 @@ bh:supportsFacet a owl:ObjectProperty ;
     rdfs:range bh:CapabilityFacetContract .
 
 bh:legacyCapabilityTag a owl:DatatypeProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range xsd:string .
+
+bh:costTier a owl:DatatypeProperty ;
+    rdfs:label "Relative Endpoint Cost Tier (low, medium, high)" ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range xsd:string .
+
+bh:latencyClass a owl:DatatypeProperty ;
+    rdfs:label "Endpoint Startup & Turn Latency Class (interactive, batch, cloud-container)" ;
     rdfs:domain bh:AgentEndpoint ;
     rdfs:range xsd:string .
 

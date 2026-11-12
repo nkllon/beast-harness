@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -17,6 +18,8 @@ from beast_harness.capability_graph import (
 )
 from beast_harness.drivers.antigravity_driver import AntigravitySdkDriver
 from beast_harness.drivers.beast_driver import BeastPeerDriver
+from beast_harness.drivers.claude_driver import ClaudeManagedDriver, ClaudeSdkDriver
+from beast_harness.drivers.codex_driver import CodexAppServerDriver
 from beast_harness.drivers.cursor_driver import CursorCloudDriver, CursorLocalDriver
 from beast_harness.ledger import SessionLedger
 from beast_harness.ref_verifier import PublishedRefVerifier
@@ -24,13 +27,16 @@ from beast_harness.secrets import ChainedSecretProvider, EnvSecretProvider
 from beast_harness.types import (
     BH_NS,
     CapabilityValidationError,
+    CostTier,
     DiscoveryQuery,
     DriverRunResult,
     EndpointDescriptor,
     ExecutionPosture,
     HarnessDriver,
     HarnessError,
+    LatencyClass,
     NoMatchingEndpointError,
+    RankingProfile,
     RefVerificationError,
     SessionRecord,
     TrustTier,
@@ -185,13 +191,15 @@ class HarnessSubstrate:
         validate_facets_for_endpoint(endpoint, facets_dict, resolved_posture)
 
         if "extra_repos" in facets_dict and isinstance(facets_dict["extra_repos"], list):
-            verified_extras: list[dict[str, str]] = []
+            verified_extras: list[dict[str, Any]] = []
             for extra in facets_dict["extra_repos"]:
                 v_extra = self._ref_verifier.verify_published_ref(
                     str(extra["url"]),
                     str(extra["ref"]),
                 )
-                verified_extras.append({"url": v_extra.repo_url, "ref": v_extra.commit_sha})
+                verified_extras.append(
+                    {**extra, "url": v_extra.repo_url, "ref": v_extra.commit_sha}
+                )
             facets_dict["extra_repos"] = verified_extras
 
         session_id = f"bh-{uuid.uuid4().hex[:12]}"
@@ -304,13 +312,15 @@ class HarnessSubstrate:
         if matching_ep and facets_dict:
             validate_facets_for_endpoint(matching_ep[0], facets_dict, session.posture)
         if "extra_repos" in facets_dict and isinstance(facets_dict["extra_repos"], list):
-            verified_extras: list[dict[str, str]] = []
+            verified_extras: list[dict[str, Any]] = []
             for extra in facets_dict["extra_repos"]:
                 v_extra = self._ref_verifier.verify_published_ref(
                     str(extra["url"]),
                     str(extra["ref"]),
                 )
-                verified_extras.append({"url": v_extra.repo_url, "ref": v_extra.commit_sha})
+                verified_extras.append(
+                    {**extra, "url": v_extra.repo_url, "ref": v_extra.commit_sha}
+                )
             facets_dict["extra_repos"] = verified_extras
 
         driver = self._resolve_driver(session.driver_id)
@@ -394,6 +404,9 @@ class HarnessSubstrate:
         required_capabilities: Sequence[str] = (),
         preferred_capabilities: Sequence[str] = (),
         exclude_model_families: Sequence[str] = (),
+        ranking_profile: RankingProfile | str = RankingProfile.BALANCED,
+        max_cost_tier: CostTier | str | None = None,
+        max_latency_class: LatencyClass | str | None = None,
         facets: dict[str, Any] | None = None,
         timeout_seconds: float = 300.0,
     ) -> SessionRecord:
@@ -402,11 +415,30 @@ class HarnessSubstrate:
                 "Independent review requires a non-empty published repo_url."
             )
 
+        resolved_profile = (
+            ranking_profile
+            if isinstance(ranking_profile, RankingProfile)
+            else RankingProfile.from_shorthand(ranking_profile)
+        )
+        resolved_cost = (
+            max_cost_tier
+            if isinstance(max_cost_tier, CostTier) or max_cost_tier is None
+            else CostTier.from_shorthand(max_cost_tier)
+        )
+        resolved_latency = (
+            max_latency_class
+            if isinstance(max_latency_class, LatencyClass) or max_latency_class is None
+            else LatencyClass.from_shorthand(max_latency_class)
+        )
+
         selection = DiscoveryQuery(
             required_capabilities=tuple(required_capabilities),
             preferred_capabilities=tuple(preferred_capabilities),
             exclude_model_families=tuple(exclude_model_families),
             required_posture=ExecutionPosture.OBSERVE_ONLY,
+            ranking_profile=resolved_profile,
+            max_cost_tier=resolved_cost,
+            max_latency_class=resolved_latency,
             only_alive=True,
         )
         started = await self.start(
@@ -425,12 +457,12 @@ class HarnessSubstrate:
 
 def _default_beast_peer_driver(secrets: ChainedSecretProvider) -> BeastPeerDriver | None:
     redis_url = os.environ.get("REDIS_URL")
-    redis_host = os.environ.get("BEAST_REDIS_HOST")
+    redis_host = os.environ.get("BEAST_REDIS_HOST") or os.environ.get("REDIS_HOST")
     if not redis_url and not redis_host:
         return None
 
     host = redis_host or "localhost"
-    port = int(os.environ.get("BEAST_REDIS_PORT", "6379"))
+    port = int(os.environ.get("BEAST_REDIS_PORT") or os.environ.get("REDIS_PORT") or "6379")
     db = int(os.environ.get("BEAST_REDIS_DB", "0"))
     if redis_url and not redis_host:
         parsed = urlsplit(redis_url)
@@ -452,19 +484,41 @@ def _default_beast_peer_driver(secrets: ChainedSecretProvider) -> BeastPeerDrive
     return candidate if candidate.is_available() else None
 
 
+def _load_env_admitted_digests() -> dict[str, str]:
+    raw = os.environ.get("BEAST_HARNESS_ADMITTED_DIGESTS_JSON")
+    if not raw or not raw.strip():
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise CapabilityValidationError(
+            "BEAST_HARNESS_ADMITTED_DIGESTS_JSON must decode to a JSON object."
+        )
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
 def create_default_substrate(state_dir: Path | None = None) -> HarnessSubstrate:
-    root = ensure_directory(
-        Path(state_dir) if state_dir is not None else Path.home() / ".beast-harness"
+    env_state = os.environ.get("BEAST_HARNESS_STATE_DIR")
+    resolved_root = (
+        Path(state_dir)
+        if state_dir is not None
+        else (Path(env_state) if env_state else Path.home() / ".beast-harness")
     )
+    root = ensure_directory(resolved_root)
+    env_db = os.environ.get("BEAST_HARNESS_DB")
+    db_path = Path(env_db) if env_db else root / "sessions.sqlite3"
     secrets = ChainedSecretProvider([EnvSecretProvider()])
     drivers: list[HarnessDriver] = [
         CursorCloudDriver(secrets=secrets),
         CursorLocalDriver(secrets=secrets),
         AntigravitySdkDriver(secrets=secrets, state_root=root / "antigravity"),
+        ClaudeManagedDriver(secrets=secrets),
+        ClaudeSdkDriver(secrets=secrets),
+        CodexAppServerDriver(secrets=secrets, state_root=root / "codex"),
     ]
     return HarnessSubstrate(
-        ledger=SessionLedger(root / "sessions.sqlite3"),
+        ledger=SessionLedger(db_path),
         ref_verifier=PublishedRefVerifier(root / "worktrees"),
         drivers=drivers,
         beast_peer_driver=_default_beast_peer_driver(secrets),
+        admitted_capability_digests=_load_env_admitted_digests(),
     )

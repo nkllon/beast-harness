@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beast-harness"
-version = "0.1.0"
-description = "Capability-modeled multi-agent execution substrate, MCP server, and Beast Network bridge (Cursor, Antigravity, Beast peers)."
+version = "0.2.0"
+description = "Capability-modeled multi-agent execution substrate, MCP server, and Beast Network bridge (Cursor, Antigravity, Claude, Codex, Beast peers)."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
@@ -24,6 +24,11 @@ antigravity = [
   "google-antigravity>=0.1.12",
   "protobuf>=7.35.0",
 ]
+claude = [
+  "anthropic>=2.8.0",
+  "claude-agent-sdk>=0.2.0",
+]
+codex = []
 beast = [
   "beast-agent>=0.2.0",
   "beast-mailbox-core>=0.5.0",
@@ -33,7 +38,7 @@ mcp = [
   "mcp>=1.8.0",
 ]
 all = [
-  "beast-harness[cursor,antigravity,beast,mcp]",
+  "beast-harness[cursor,antigravity,claude,codex,beast,mcp]",
 ]
 dev = [
   "pytest>=8.0.0",
