@@ -1,0 +1,175 @@
+@prefix bh: <https://nkllon.com/ontology/beast-harness#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://nkllon.com/ontology/beast-harness> a owl:Ontology ;
+    rdfs:label "Beast Harness Non-LCD Agent & Capability Ontology" ;
+    bh:schemaVersion "0.1.0" ;
+    bh:intendedAudience
+        "LLM calling agents inspecting runtime capability facets via MCP or Beast Network",
+        "Deterministic SHACL/RDF routers and Casper closeout verifiers",
+        "Human operators and harness driver authors" ;
+    dcterms:description "Models heterogeneous coding-agent harnesses, foundation model profiles, trust tiers, execution postures, and capability-scoped facet contracts without least-common-denominator flattening." .
+
+# Core Classes
+bh:AgentEndpoint a owl:Class ;
+    rdfs:label "Agent Endpoint" ;
+    rdfs:comment "An addressable SDK driver instance or live Beast Network peer." .
+
+bh:ModelProfile a owl:Class ;
+    rdfs:label "Foundation Model Profile" ;
+    rdfs:comment "Model family and reasoning/context traits used for cross-family independence and routing." .
+
+bh:HarnessCapability a owl:Class ;
+    rdfs:label "Harness or Domain Capability" ;
+    rdfs:comment "Open-world capability class. Endpoints declare built-in bh:* capabilities or domain-specific Beast peer capability IRIs." .
+
+bh:CapabilityFacetContract a owl:Class ;
+    rdfs:label "Capability Facet Contract" ;
+    rdfs:comment "Typed input/output JSON Schema contract bound to a declared HarnessCapability on an AgentEndpoint." .
+
+bh:TrustTier a owl:Class ;
+    rdfs:label "Capability Trust Tier" .
+
+bh:ExecutionPosture a owl:Class ;
+    rdfs:label "Execution Mutability Posture" .
+
+# Trust Tier Individuals
+bh:RuntimeSelfAnnounced a bh:TrustTier ;
+    rdfs:label "Tier 1: Runtime Self-Announced (Ad-hoc MCP & Beast Bus)" .
+
+bh:Neo4jAdmitted a bh:TrustTier ;
+    rdfs:label "Tier 2: Operational Neo4j Admitted (Governed Casper & HACP)" .
+
+# Execution Posture Individuals
+bh:ObserveOnly a bh:ExecutionPosture ;
+    rdfs:label "Observe Only (Strict Read-Only / Independent Review Default)" .
+
+bh:ProposeDiff a bh:ExecutionPosture ;
+    rdfs:label "Propose Diff (Return Patch Without Remote Branch Push or PR Creation)" .
+
+bh:IsolatedBranchWrite a bh:ExecutionPosture ;
+    rdfs:label "Isolated Branch Write (Explicit Opt-In / HACP-Gated Remote Branch or PR)" .
+
+# Built-in Non-LCD Harness Capabilities (Open-World Extensible)
+bh:RemoteGitShaMount a bh:HarnessCapability ;
+    rdfs:label "Remote Published Git Commit SHA Mount" .
+
+bh:MultiRepoMount a bh:HarnessCapability ;
+    rdfs:label "Simultaneous Multi-Repository Ref Mount" .
+
+bh:LocalDetachedWorktree a bh:HarnessCapability ;
+    rdfs:label "Local Ephemeral Read-Only Detached Worktree Mount" .
+
+bh:RepoFreePrompt a bh:HarnessCapability ;
+    rdfs:label "Standalone Repository-Free Prompt Execution" .
+
+bh:SemanticCodebaseIndex a bh:HarnessCapability ;
+    rdfs:label "Pre-Indexed Semantic Codebase Search & Embeddings" .
+
+bh:LspSymbolGraph a bh:HarnessCapability ;
+    rdfs:label "Language Server Protocol & Call-Graph Navigation" .
+
+bh:AstRipgrepSearch a bh:HarnessCapability ;
+    rdfs:label "Local File, Directory, and Regex/AST Search" .
+
+bh:ReadOnlyPolicyHook a bh:HarnessCapability ;
+    rdfs:label "Deterministic Harness-Enforced Read-Only Tool Policy Hook" .
+
+bh:IsolatedContainerExec a bh:HarnessCapability ;
+    rdfs:label "Sandboxed Container Command & Test Execution" .
+
+bh:SubagentDelegation a bh:HarnessCapability ;
+    rdfs:label "Hierarchical Subagent Delegation" .
+
+bh:InlineMcpAttachment a bh:HarnessCapability ;
+    rdfs:label "Per-Session Custom MCP Tool Attachment" .
+
+bh:DurableCloudRun a bh:HarnessCapability ;
+    rdfs:label "Durable Asynchronous Cloud Agent & Per-Run Lifecycle" .
+
+bh:MidRunSteering a bh:HarnessCapability ;
+    rdfs:label "Live Mid-Execution Prompt/Event Steering" .
+
+bh:FollowUpRunQueue a bh:HarnessCapability ;
+    rdfs:label "Multi-Turn Sequential Run Resumption" .
+
+bh:WebhookStatusPush a bh:HarnessCapability ;
+    rdfs:label "Webhook Terminal Status Notification" .
+
+bh:StructuredOutputSchema a bh:HarnessCapability ;
+    rdfs:label "Schema-Validated Structured JSON Response Output" .
+
+bh:VerifiableToolAuditStream a bh:HarnessCapability ;
+    rdfs:label "Auditable Tool-Call & Trajectory Event Stream" .
+
+bh:ThinkingEffortControl a bh:HarnessCapability ;
+    rdfs:label "Configurable Reasoning / Thinking Effort Level" .
+
+# Object & Datatype Properties
+bh:endpointId a owl:DatatypeProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range xsd:string .
+
+bh:driverId a owl:DatatypeProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range xsd:string .
+
+bh:trustTier a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:TrustTier .
+
+bh:defaultPosture a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:ExecutionPosture .
+
+bh:supportsPosture a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:ExecutionPosture .
+
+bh:hasModelProfile a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:ModelProfile .
+
+bh:hasCapability a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:HarnessCapability .
+
+bh:supportsFacet a owl:ObjectProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range bh:CapabilityFacetContract .
+
+bh:legacyCapabilityTag a owl:DatatypeProperty ;
+    rdfs:domain bh:AgentEndpoint ;
+    rdfs:range xsd:string .
+
+bh:modelFamily a owl:DatatypeProperty ;
+    rdfs:domain bh:ModelProfile ;
+    rdfs:range xsd:string .
+
+bh:modelIdentifier a owl:DatatypeProperty ;
+    rdfs:domain bh:ModelProfile ;
+    rdfs:range xsd:string .
+
+bh:contextWindowTokens a owl:DatatypeProperty ;
+    rdfs:domain bh:ModelProfile ;
+    rdfs:range xsd:integer .
+
+bh:forCapability a owl:ObjectProperty ;
+    rdfs:domain bh:CapabilityFacetContract ;
+    rdfs:range bh:HarnessCapability .
+
+bh:facetKey a owl:DatatypeProperty ;
+    rdfs:domain bh:CapabilityFacetContract ;
+    rdfs:range xsd:string .
+
+bh:inputJsonSchema a owl:DatatypeProperty ;
+    rdfs:domain bh:CapabilityFacetContract ;
+    rdfs:range xsd:string .
+
+bh:outputJsonSchema a owl:DatatypeProperty ;
+    rdfs:domain bh:CapabilityFacetContract ;
+    rdfs:range xsd:string .

@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beast-harness"
+version = "0.1.0"
+description = "Capability-modeled multi-agent execution substrate, MCP server, and Beast Network bridge (Cursor, Antigravity, Beast peers)."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.27.0,<1.0.0",
+  "pydantic>=2.7.0",
+  "pyshacl>=0.26.0",
+  "rdflib>=7.0.0",
+]
+
+[project.optional-dependencies]
+cursor = [
+  "cursor-sdk>=1.3.0",
+]
+antigravity = [
+  "google-antigravity>=0.1.12",
+  "protobuf>=7.35.0",
+]
+beast = [
+  "beast-agent>=0.2.0",
+  "beast-mailbox-core>=0.5.0",
+  "redis>=5.0.0",
+]
+mcp = [
+  "mcp>=1.8.0",
+]
+all = [
+  "beast-harness[cursor,antigravity,beast,mcp]",
+]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.9.0",
+  "starlette>=0.40.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+beast-harness-mcp = "beast_harness.mcp_server:main"
+beast-harness-bridge = "beast_harness.beast_bridge:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"beast_harness.ontology" = ["*.ttl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+
+[tool.uv.sources]
+beast-agent = { path = "../beast-agent-codex-capability-ttl", editable = true }
+beast-mailbox-core = { path = "../../cursor/beast-mailbox-core", editable = true }

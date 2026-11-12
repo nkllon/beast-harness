@@ -1,0 +1,112 @@
+@prefix bh: <https://nkllon.com/ontology/beast-harness#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://nkllon.com/ontology/beast-harness/shapes>
+    rdfs:label "SHACL Validation Shapes for Beast Harness Capability Announcements" ;
+    bh:intendedAudience
+        "LLM calling agents inspecting runtime capability facets",
+        "Fail-closed runtime capability ingestion and Neo4j qualification gates",
+        "Human operators authoring driver or Beast peer capability graphs" .
+
+bh:AgentEndpointShape a sh:NodeShape ;
+    sh:targetClass bh:AgentEndpoint ;
+    sh:property [
+        sh:path bh:endpointId ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 1 ;
+        sh:message "AgentEndpoint requires exactly one non-empty bh:endpointId." ;
+    ] ;
+    sh:property [
+        sh:path bh:driverId ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 1 ;
+        sh:message "AgentEndpoint requires exactly one non-empty bh:driverId." ;
+    ] ;
+    sh:property [
+        sh:path bh:trustTier ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:in ( bh:RuntimeSelfAnnounced bh:Neo4jAdmitted ) ;
+        sh:message "AgentEndpoint requires exactly one valid bh:trustTier." ;
+    ] ;
+    sh:property [
+        sh:path bh:defaultPosture ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:in ( bh:ObserveOnly ) ;
+        sh:message "AgentEndpoint defaultPosture must be bh:ObserveOnly (read-only by default)." ;
+    ] ;
+    sh:property [
+        sh:path bh:supportsPosture ;
+        sh:minCount 1 ;
+        sh:in ( bh:ObserveOnly bh:ProposeDiff bh:IsolatedBranchWrite ) ;
+        sh:message "AgentEndpoint must declare at least one valid bh:supportsPosture." ;
+    ] ;
+    sh:or (
+        [
+            sh:property [
+                sh:path bh:hasCapability ;
+                sh:minCount 1 ;
+            ]
+        ]
+        [
+            sh:property [
+                sh:path bh:legacyCapabilityTag ;
+                sh:datatype xsd:string ;
+                sh:minCount 1 ;
+                sh:minLength 1 ;
+            ]
+        ]
+    ) .
+
+bh:ModelProfileShape a sh:NodeShape ;
+    sh:targetClass bh:ModelProfile ;
+    sh:property [
+        sh:path bh:modelFamily ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 1 ;
+        sh:message "ModelProfile requires exactly one non-empty bh:modelFamily." ;
+    ] ;
+    sh:property [
+        sh:path bh:modelIdentifier ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 1 ;
+        sh:message "ModelProfile requires exactly one non-empty bh:modelIdentifier." ;
+    ] .
+
+bh:CapabilityFacetContractShape a sh:NodeShape ;
+    sh:targetClass bh:CapabilityFacetContract ;
+    sh:property [
+        sh:path bh:forCapability ;
+        sh:nodeKind sh:IRI ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "CapabilityFacetContract requires exactly one IRI bh:forCapability." ;
+    ] ;
+    sh:property [
+        sh:path bh:facetKey ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 1 ;
+        sh:message "CapabilityFacetContract requires exactly one non-empty bh:facetKey." ;
+    ] ;
+    sh:property [
+        sh:path bh:inputJsonSchema ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:minLength 2 ;
+        sh:message "CapabilityFacetContract requires a JSON Schema string in bh:inputJsonSchema." ;
+    ] .
