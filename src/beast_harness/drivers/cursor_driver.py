@@ -76,7 +76,7 @@ class CursorCloudDriver:
         self._secret_key_name = secret_key_name
 
     def is_available(self) -> bool:
-        return self._secrets.get_secret(self._secret_key_name) is not None
+        return self._secrets.has_secret(self._secret_key_name)
 
     def announce_capabilities_ttl(self) -> list[str]:
         extra_repos_schema = json.dumps(
@@ -431,9 +431,8 @@ class CursorLocalDriver:
         self._runs: dict[str, DriverRunResult] = {}
 
     def is_available(self) -> bool:
-        return (
-            importlib.util.find_spec("cursor_sdk") is not None
-            and self._secrets.get_secret(self._secret_key_name) is not None
+        return importlib.util.find_spec("cursor_sdk") is not None and self._secrets.has_secret(
+            self._secret_key_name
         )
 
     def announce_capabilities_ttl(self) -> list[str]:

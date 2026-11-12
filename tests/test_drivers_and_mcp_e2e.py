@@ -22,7 +22,12 @@ from beast_harness.drivers.cursor_driver import CursorCloudDriver
 from beast_harness.ledger import SessionLedger
 from beast_harness.mcp_server import build_mcp_server
 from beast_harness.ref_verifier import PublishedRefVerifier
-from beast_harness.secrets import CallbackSecretProvider, ChainedSecretProvider, EnvSecretProvider
+from beast_harness.secrets import (
+    CallbackSecretProvider,
+    ChainedSecretProvider,
+    CommandSecretProvider,
+    EnvSecretProvider,
+)
 from beast_harness.substrate import HarnessSubstrate
 from beast_harness.types import (
     BH_NS,
@@ -292,6 +297,50 @@ async def test_cursor_cloud_driver_and_mcp_server_e2e(tmp_path: Path):
         )
         assert bad_tier["ok"] is False
         assert bad_tier["error_type"] == "CapabilityValidationError"
+
+        # Regression R-1: single-use secret broker + failing CommandSecretProvider on unused driver
+        su_reads = {"count": 0}
+
+        def _burn_once(name: str) -> str | None:
+            if name == "CURSOR_API_KEY" and su_reads["count"] == 0:
+                su_reads["count"] += 1
+                return "crsr_test_live_key"
+            return None
+
+        su_secrets = ChainedSecretProvider(
+            [
+                CallbackSecretProvider(
+                    _burn_once,
+                    label="magpie-single-use",
+                    has_secret_fn=lambda k: k == "CURSOR_API_KEY",
+                )
+            ]
+        )
+        broken_cmd_secrets = ChainedSecretProvider(
+            [
+                CommandSecretProvider(
+                    {"GEMINI_API_KEY": ["python3", "-c", "import sys; sys.exit(2)"]}
+                )
+            ]
+        )
+        su_substrate = HarnessSubstrate(
+            ledger=SessionLedger(tmp_path / "su_ledger.sqlite3"),
+            ref_verifier=PublishedRefVerifier(tmp_path / "su_wt"),
+            drivers=[
+                CursorCloudDriver(secrets=su_secrets, http_client=client),
+                AntigravitySdkDriver(secrets=broken_cmd_secrets, state_root=tmp_path / "su_agy"),
+            ],
+        )
+        eps_disc = await su_substrate.discover()
+        assert len(eps_disc) == 2
+        assert su_reads["count"] == 0  # Discovery did NOT burn the single-use secret!
+
+        su_session = await su_substrate.start(
+            prompt="Execute using single-use Magpie secret",
+            target_endpoint_id="cursor-cloud",
+        )
+        assert su_reads["count"] == 1
+        assert su_session.native_agent_id.startswith("bc-")
 
 
 def test_antigravity_sdk_driver_workspace_and_policy_configuration(tmp_path: Path):

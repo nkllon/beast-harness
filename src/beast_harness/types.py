@@ -197,6 +197,8 @@ class DriverRunResult(BaseModel):
 class SecretProvider(Protocol):
     """Pluggable secret resolution boundary (never exposes values via repr or tool args)."""
 
+    def has_secret(self, name: str) -> bool: ...
+
     def get_secret(self, name: str) -> str | None: ...
 
 

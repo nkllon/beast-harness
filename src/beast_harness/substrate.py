@@ -25,6 +25,7 @@ from beast_harness.types import (
     BH_NS,
     CapabilityValidationError,
     DiscoveryQuery,
+    DriverRunResult,
     EndpointDescriptor,
     ExecutionPosture,
     HarnessDriver,
@@ -361,6 +362,18 @@ class HarnessSubstrate:
         if session.status.is_terminal:
             if session.worktree_path:
                 self._ref_verifier.cleanup_worktree(session.worktree_path)
+                return self._ledger.update_from_driver_result(
+                    session_id,
+                    DriverRunResult(
+                        native_agent_id=session.native_agent_id,
+                        run_id=session.latest_run_id,
+                        state=session.status,
+                        answer=session.answer,
+                        structured_output=session.structured_output,
+                        error_detail=session.error_detail,
+                    ),
+                    clear_worktree=True,
+                )
             return session
         driver = self._resolve_driver(session.driver_id)
         cancelled = await driver.cancel_run(session=session)

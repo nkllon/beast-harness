@@ -216,6 +216,7 @@ class BeastHarnessBridgeAgent(BaseAgent):
                     created_at=now,
                     updated_at=now,
                 )
+                self._sessions_by_run_id[req_run_id] = session
                 final = (
                     started
                     if started.state.is_terminal
@@ -247,6 +248,7 @@ class BeastHarnessBridgeAgent(BaseAgent):
                     facets=dict(payload.get("facets") or {}),
                 )
                 temp_session = prior.model_copy(update={"latest_run_id": followed.run_id})
+                self._sessions_by_run_id[req_run_id] = temp_session
                 final = (
                     followed
                     if followed.state.is_terminal

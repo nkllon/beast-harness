@@ -89,10 +89,9 @@ class AntigravitySdkDriver:
         self._runs: dict[str, DriverRunResult] = {}
 
     def is_available(self) -> bool:
-        return (
-            importlib.util.find_spec("google.antigravity") is not None
-            and self._secrets.get_secret(self._secret_key_name) is not None
-        )
+        return importlib.util.find_spec(
+            "google.antigravity"
+        ) is not None and self._secrets.has_secret(self._secret_key_name)
 
     def announce_capabilities_ttl(self) -> list[str]:
         effort_schema = json.dumps(

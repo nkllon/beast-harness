@@ -13,6 +13,9 @@ class EnvSecretProvider:
     def __init__(self, env: Mapping[str, str] | None = None) -> None:
         self._env = dict(env) if env is not None else None
 
+    def has_secret(self, name: str) -> bool:
+        return self.get_secret(name) is not None
+
     def get_secret(self, name: str) -> str | None:
         source = self._env if self._env is not None else os.environ
         val = source.get(name)
@@ -27,9 +30,21 @@ class EnvSecretProvider:
 
 
 class CallbackSecretProvider:
-    def __init__(self, resolver: Callable[[str], str | None], label: str = "callback") -> None:
+    def __init__(
+        self,
+        resolver: Callable[[str], str | None],
+        label: str = "callback",
+        *,
+        has_secret_fn: Callable[[str], bool] | None = None,
+    ) -> None:
         self._resolver = resolver
         self._label = label
+        self._has_secret_fn = has_secret_fn
+
+    def has_secret(self, name: str) -> bool:
+        if self._has_secret_fn is not None:
+            return bool(self._has_secret_fn(name))
+        return self.get_secret(name) is not None
 
     def get_secret(self, name: str) -> str | None:
         val = self._resolver(name)
@@ -50,6 +65,10 @@ class CommandSecretProvider:
     ) -> None:
         self._commands = {k: tuple(v) for k, v in commands_by_name.items()}
         self._timeout = timeout
+
+    def has_secret(self, name: str) -> bool:
+        # Non-consuming configuration check (does not spawn CLI subprocess during discovery)
+        return bool(self._commands.get(name))
 
     def get_secret(self, name: str) -> str | None:
         cmd = self._commands.get(name)
@@ -77,6 +96,15 @@ class CommandSecretProvider:
 class ChainedSecretProvider:
     def __init__(self, providers: Sequence[SecretProvider]) -> None:
         self._providers = tuple(providers)
+
+    def has_secret(self, name: str) -> bool:
+        for provider in self._providers:
+            try:
+                if provider.has_secret(name):
+                    return True
+            except SecretResolutionError:
+                continue
+        return False
 
     def get_secret(self, name: str) -> str | None:
         for provider in self._providers:
