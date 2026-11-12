@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import shutil
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from beast_harness.secrets import ChainedSecretProvider
+from beast_harness.secrets import ChainedSecretProvider, ensure_chained_secret_provider
 from beast_harness.types import (
     BH_NS,
     DriverRunResult,
@@ -23,6 +25,7 @@ from beast_harness.types import (
     HarnessError,
     PostureViolationError,
     RunState,
+    SecretProvider,
     SessionRecord,
     VerifiedRepoRef,
 )
@@ -46,13 +49,159 @@ _READ_ONLY_CLAUDE_TOOLS = frozenset(
     }
 )
 
+_PROPOSE_DIFF_EDIT_TOOLS = frozenset(
+    {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+    }
+)
+
+_PROPOSE_DIFF_ALLOWED_TOOLS = _READ_ONLY_CLAUDE_TOOLS | _PROPOSE_DIFF_EDIT_TOOLS
+
 _MUTATING_CLAUDE_DISALLOWED_TOOLS = [
     "Bash",
     "Write",
     "Edit",
     "MultiEdit",
     "NotebookEdit",
+    "Task",
+    "WebFetch",
+    "WebSearch",
 ]
+
+_PROPOSE_DIFF_DISALLOWED_TOOLS = [
+    "Bash",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+]
+
+
+def _extract_candidate_tool_paths(input_data: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("file_path", "notebook_path", "path"):
+        raw = input_data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            paths.append(raw.strip())
+    edits = input_data.get("edits")
+    if isinstance(edits, list):
+        for entry in edits:
+            if isinstance(entry, dict):
+                for key in ("file_path", "path"):
+                    raw = entry.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        paths.append(raw.strip())
+    return paths
+
+
+def _check_propose_diff_tool_input(
+    tool_name: str,
+    input_data: dict[str, Any],
+    workspace_path: str | None,
+) -> str | None:
+    """Return None if tool call is allowed under ProposeDiff, else a denial reason."""
+    if tool_name not in _PROPOSE_DIFF_ALLOWED_TOOLS:
+        return f"Tool {tool_name!r} is denied under beast-harness ProposeDiff posture."
+
+    candidate_paths = _extract_candidate_tool_paths(input_data)
+    if tool_name in _PROPOSE_DIFF_EDIT_TOOLS:
+        if not workspace_path or not workspace_path.strip():
+            return "ProposeDiff file modifications require a mounted workspace_path."
+        if not candidate_paths:
+            return f"Tool {tool_name!r} requires an explicit target path inside workspace_path."
+
+    if workspace_path and workspace_path.strip() and candidate_paths:
+        ws_root = Path(workspace_path).resolve()
+        for raw_p in candidate_paths:
+            candidate = Path(raw_p)
+            resolved = (
+                candidate.resolve() if candidate.is_absolute() else (ws_root / candidate).resolve()
+            )
+            if not resolved.is_relative_to(ws_root):
+                return (
+                    f"Path {raw_p!r} escapes workspace_path {str(ws_root)!r} "
+                    "under ProposeDiff posture."
+                )
+    return None
+
+
+def _build_isolated_claude_transport(
+    prompt: str,
+    options: Any,
+    *,
+    base_env: Mapping[str, str],
+) -> Any:
+    """Build a SubprocessCLITransport that never merges ambient os.environ into child env."""
+    import anyio
+    from claude_agent_sdk._internal.transport import subprocess_cli
+    from claude_agent_sdk.types import _configure_can_use_tool
+
+    configured_options = _configure_can_use_tool(options)
+    isolated_base = {k: v for k, v in base_env.items() if k != "CLAUDECODE"}
+
+    class _IsolatedSubprocessCLITransport(subprocess_cli.SubprocessCLITransport):
+        async def connect(self) -> None:
+            if self._process:
+                return
+            if self._cli_path is None:
+                self._cli_path = await anyio.to_thread.run_sync(self._find_cli)
+            self._reject_windows_batch_cli(self._cli_path)
+
+            cmd = self._build_command()
+            try:
+                process_env: dict[str, str] = {
+                    **isolated_base,
+                    "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+                    **self._options.env,
+                    "CLAUDE_AGENT_SDK_VERSION": subprocess_cli.__version__,
+                }
+                if not any(
+                    key.upper() == subprocess_cli._SDK_READS_SESSION_STATE_ENV
+                    for key in process_env
+                ):
+                    process_env[subprocess_cli._SDK_READS_SESSION_STATE_ENV] = "1"
+                if self._options.enable_file_checkpointing:
+                    process_env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
+                if self._cwd:
+                    process_env["PWD"] = self._cwd
+
+                stderr_dest = subprocess_cli.PIPE if self._options.stderr is not None else None
+                self._process = await anyio.open_process(
+                    cmd,
+                    stdin=subprocess_cli.PIPE,
+                    stdout=subprocess_cli.PIPE,
+                    stderr=stderr_dest,
+                    cwd=self._cwd,
+                    env=process_env,
+                    user=self._options.user,
+                )
+                subprocess_cli._ACTIVE_CHILDREN.add(self._process)
+                if self._process.stdout:
+                    self._stdout_stream = subprocess_cli.TextReceiveStream(self._process.stdout)
+                if stderr_dest is subprocess_cli.PIPE and self._process.stderr:
+                    self._stderr_stream = subprocess_cli.TextReceiveStream(self._process.stderr)
+                    self._stderr_task = subprocess_cli.spawn_detached(self._handle_stderr())
+                if self._process.stdin:
+                    self._stdin_stream = subprocess_cli.TextSendStream(self._process.stdin)
+                self._ready = True
+            except FileNotFoundError as exc:
+                if self._cwd and not Path(self._cwd).exists():
+                    err = subprocess_cli.CLIConnectionError(
+                        f"Working directory does not exist: {self._cwd}"
+                    )
+                    self._exit_error = err
+                    raise err from exc
+                err = subprocess_cli.CLINotFoundError(f"Claude Code not found at: {self._cli_path}")
+                self._exit_error = err
+                raise err from exc
+            except Exception as exc:
+                err = subprocess_cli.CLIConnectionError(f"Failed to start Claude Code: {exc}")
+                self._exit_error = err
+                raise err from exc
+
+    return _IsolatedSubprocessCLITransport(prompt=prompt, options=configured_options)
 
 
 def _format_repo_context_suffix(repo_ref: VerifiedRepoRef | None) -> str:
@@ -138,28 +287,35 @@ class ClaudeManagedDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         base_url: str = "https://api.anthropic.com",
         http_client: httpx.AsyncClient | None = None,
         secret_key_name: str = "ANTHROPIC_API_KEY",
         github_secret_key_name: str = "GITHUB_TOKEN",
         default_agent_id: str | None = None,
         default_environment_id: str | None = None,
+        base_env: Mapping[str, str] | None = None,
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._base_url = base_url.rstrip("/")
         self._http_client = http_client
         self._secret_key_name = secret_key_name
         self._github_secret_key_name = github_secret_key_name
         self._default_agent_id = default_agent_id
         self._default_environment_id = default_environment_id
+        self._base_env = dict(base_env) if base_env is not None else None
+        self._min_user_messages_by_session: dict[str, int] = {}
+
+    def _env_value(self, key: str) -> str | None:
+        source = self._base_env if self._base_env is not None else os.environ
+        return source.get(key)
 
     def _resolve_default_agent_id(self) -> str | None:
-        val = self._default_agent_id or os.environ.get("ANTHROPIC_MANAGED_AGENT_ID")
+        val = self._default_agent_id or self._env_value("ANTHROPIC_MANAGED_AGENT_ID")
         return val.strip() if val and val.strip() else None
 
     def _resolve_default_environment_id(self) -> str | None:
-        val = self._default_environment_id or os.environ.get("ANTHROPIC_MANAGED_ENVIRONMENT_ID")
+        val = self._default_environment_id or self._env_value("ANTHROPIC_MANAGED_ENVIRONMENT_ID")
         return val.strip() if val and val.strip() else None
 
     def is_available(self) -> bool:
@@ -390,6 +546,7 @@ class ClaudeManagedDriver:
         if not raw_sid or not str(raw_sid).strip():
             raise HarnessError("Anthropic Managed Agents response did not include session id.")
         managed_sid = str(raw_sid).strip()
+        self._min_user_messages_by_session[managed_sid] = 1
         run_id = f"{managed_sid}-turn-1"
         mapped_state = _map_managed_session_status(str(data.get("status") or "running"))
 
@@ -418,6 +575,10 @@ class ClaudeManagedDriver:
         prompt: str,
         facets: dict[str, Any],
     ) -> DriverRunResult:
+        if facets.get("vault_ids") and session.posture == ExecutionPosture.OBSERVE_ONLY:
+            raise PostureViolationError(
+                "Facet 'vault_ids' cannot be attached under ObserveOnly execution posture."
+            )
         effective_prompt = (
             f"{prompt}{_OBSERVE_GUARDRAIL}"
             if session.posture == ExecutionPosture.OBSERVE_ONLY
@@ -441,6 +602,8 @@ class ClaudeManagedDriver:
                 f"Anthropic Managed Agents POST /events failed with HTTP "
                 f"{resp.status_code}: {resp.text}"
             )
+        prev_turns = self._min_user_messages_by_session.get(session.native_agent_id, 1)
+        self._min_user_messages_by_session[session.native_agent_id] = prev_turns + 1
         run_id = f"{session.native_agent_id}-turn-{uuid.uuid4().hex[:6]}"
         return DriverRunResult(
             native_agent_id=session.native_agent_id,
@@ -478,12 +641,14 @@ class ClaudeManagedDriver:
         headers = self._auth_headers()
         headers["Accept"] = "text/event-stream"
         path = f"/v1/sessions/{session.native_agent_id}/events/stream"
+        required_user_messages = self._min_user_messages_by_session.get(session.native_agent_id, 1)
 
         streamed_events: list[dict[str, Any]] = []
         final_state: RunState | None = None
+        seen_user_messages = 0
 
         async def _consume(client: httpx.AsyncClient) -> None:
-            nonlocal final_state
+            nonlocal final_state, seen_user_messages
             async with client.stream("GET", path, headers=headers, timeout=timeout_seconds) as resp:
                 if resp.status_code >= 400:
                     return
@@ -499,13 +664,20 @@ class ClaudeManagedDriver:
                         continue
                     streamed_events.append(ev)
                     ev_type = str(ev.get("type") or "")
-                    if ev_type in {"session.status_idle", "turn.completed"}:
+                    if ev_type == "user.message":
+                        seen_user_messages += 1
+                    elif ev_type in {"session.status_idle", "turn.completed"}:
+                        if 0 < seen_user_messages < required_user_messages:
+                            # Historical idle event replayed from an earlier turn; keep reading.
+                            continue
                         final_state = RunState.FINISHED
                         break
-                    if ev_type in {"session.status_terminated"}:
+                    elif ev_type in {"session.status_terminated"}:
                         final_state = RunState.CANCELLED
                         break
-                    if ev_type in {"session.error", "error"}:
+                    elif ev_type in {"session.error", "error"}:
+                        if 0 < seen_user_messages < required_user_messages:
+                            continue
                         final_state = RunState.ERROR
                         break
 
@@ -520,6 +692,12 @@ class ClaudeManagedDriver:
 
         if final_state is None:
             return None
+
+        if seen_user_messages == 0 and required_user_messages > 1:
+            polled = await self.poll_run(session=session)
+            if not polled.state.is_terminal:
+                return None
+            return polled
 
         answer, audit_events, error_detail = _extract_turn_events_and_answer(streamed_events)
         if answer is None and final_state == RunState.FINISHED:
@@ -587,23 +765,30 @@ class ClaudeSdkDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         secret_key_name: str = "ANTHROPIC_API_KEY",
         cli_binary: str = "claude",
         allow_cli_login: bool = True,
+        base_env: Mapping[str, str] | None = None,
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._secret_key_name = secret_key_name
         self._cli_binary = cli_binary
         self._allow_cli_login = allow_cli_login
+        self._base_env = dict(base_env) if base_env is not None else None
         self._runs: dict[str, DriverRunResult] = {}
+
+    def _which_cli(self) -> str | None:
+        if self._base_env is not None and "PATH" in self._base_env:
+            return shutil.which(self._cli_binary, path=self._base_env.get("PATH"))
+        return shutil.which(self._cli_binary)
 
     def is_available(self) -> bool:
         if importlib.util.find_spec("claude_agent_sdk") is None:
             return False
         if self._secrets.has_secret(self._secret_key_name):
             return True
-        return self._allow_cli_login and shutil.which(self._cli_binary) is not None
+        return self._allow_cli_login and self._which_cli() is not None
 
     def announce_capabilities_ttl(self) -> list[str]:
         effort_schema = json.dumps(
@@ -706,17 +891,19 @@ class ClaudeSdkDriver:
 
         async def _propose_diff_policy(
             tool_name: str,
-            _input_data: dict[str, Any],
+            input_data: dict[str, Any],
             _context: Any,
         ) -> Any:
-            if tool_name == "Bash":
-                return cas.PermissionResultDeny(
-                    message="Arbitrary shell execution is denied under ProposeDiff posture.",
-                    interrupt=False,
-                )
+            denial = _check_propose_diff_tool_input(
+                tool_name,
+                input_data if isinstance(input_data, dict) else {},
+                workspace_path,
+            )
+            if denial is not None:
+                return cas.PermissionResultDeny(message=denial, interrupt=False)
             return cas.PermissionResultAllow()
 
-        env_overrides: dict[str, str] = {}
+        env_overrides: dict[str, str] = dict(self._base_env) if self._base_env is not None else {}
         if api_key:
             env_overrides["ANTHROPIC_API_KEY"] = api_key
 
@@ -724,7 +911,7 @@ class ClaudeSdkDriver:
             disallowed = list(_MUTATING_CLAUDE_DISALLOWED_TOOLS)
             can_use = _observe_only_policy
         else:
-            disallowed = ["Bash"]
+            disallowed = list(_PROPOSE_DIFF_DISALLOWED_TOOLS)
             can_use = _propose_diff_policy
 
         output_fmt: dict[str, Any] | None = None
@@ -734,7 +921,7 @@ class ClaudeSdkDriver:
                 "schema": facets["structured_output_schema"],
             }
 
-        cli_resolved = shutil.which(self._cli_binary)
+        cli_resolved = self._which_cli()
         opts_kwargs: dict[str, Any] = {
             "cwd": workspace_path,
             "disallowed_tools": disallowed,
@@ -776,7 +963,7 @@ class ClaudeSdkDriver:
         api_key: str | None = None
         if self._secrets.has_secret(self._secret_key_name):
             api_key = self._secrets.require_secret(self._secret_key_name)
-        elif not (self._allow_cli_login and shutil.which(self._cli_binary)):
+        elif not (self._allow_cli_login and self._which_cli()):
             raise HarnessError(
                 f"ClaudeSdkDriver requires {self._secret_key_name} or an installed 'claude' CLI."
             )
@@ -797,8 +984,18 @@ class ClaudeSdkDriver:
         error_detail: str | None = None
         state = RunState.FINISHED
 
+        query_kwargs: dict[str, Any] = {"prompt": prompt, "options": opts}
+        if self._base_env is not None:
+            sig = inspect.signature(cas.query)
+            if "transport" in sig.parameters:
+                query_kwargs["transport"] = _build_isolated_claude_transport(
+                    prompt,
+                    opts,
+                    base_env=opts.env,
+                )
+
         try:
-            async for msg in cas.query(prompt=prompt, options=opts):
+            async for msg in cas.query(**query_kwargs):
                 if isinstance(msg, cas.AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, cas.TextBlock) and block.text:

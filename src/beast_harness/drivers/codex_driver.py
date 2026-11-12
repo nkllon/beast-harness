@@ -9,12 +9,13 @@ import os
 import shutil
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from beast_harness.secrets import ChainedSecretProvider
+from beast_harness.secrets import ChainedSecretProvider, ensure_chained_secret_provider
 from beast_harness.types import (
     BH_NS,
     DriverRunResult,
@@ -22,6 +23,7 @@ from beast_harness.types import (
     ExecutionPosture,
     HarnessError,
     RunState,
+    SecretProvider,
     SessionRecord,
     VerifiedRepoRef,
     ensure_directory,
@@ -77,8 +79,27 @@ class _CodexJsonRpcConnection:
         self.completed_messages: list[str] = []
         self.delta_chunks: dict[str, list[str]] = {}
         self.audit_events: list[dict[str, Any]] = []
+        self.stderr_tail: deque[str] = deque(maxlen=64)
         self.protocol_error: str | None = None
+        self._stderr_task = asyncio.create_task(self._stderr_drain_loop())
         self._reader_task = asyncio.create_task(self._read_loop())
+
+    async def _stderr_drain_loop(self) -> None:
+        if self.proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = await self.proc.stderr.read(4096)
+                if not chunk:
+                    break
+                for line in chunk.decode("utf-8", errors="replace").splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        self.stderr_tail.append(stripped[:512])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if self.proc.stdin is None:
@@ -242,21 +263,20 @@ class _CodexJsonRpcConnection:
         except Exception as exc:
             self.protocol_error = str(exc)
         finally:
+            stderr_hint = "; ".join(list(self.stderr_tail)[-3:]) if self.stderr_tail else ""
+            fallback_err = self.protocol_error or (
+                f"Codex app-server closed stream: {stderr_hint}"
+                if stderr_hint
+                else "Codex app-server closed stream before replying."
+            )
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(
-                        HarnessError(
-                            self.protocol_error or "Codex app-server closed stream before replying."
-                        )
-                    )
+                    fut.set_exception(HarnessError(fallback_err))
             if not self.turn_done.is_set():
                 if self.final_turn is None:
                     self.final_turn = {
                         "status": "failed",
-                        "error": {
-                            "message": self.protocol_error
-                            or "Codex app-server exited before turn/completed."
-                        },
+                        "error": {"message": fallback_err},
                     }
                 self.turn_done.set()
 
@@ -317,8 +337,11 @@ class _CodexJsonRpcConnection:
 
     async def close(self) -> None:
         self._reader_task.cancel()
+        self._stderr_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await self._reader_task
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._stderr_task
         if self.proc.stdin is not None:
             with contextlib.suppress(Exception):
                 self.proc.stdin.close()
@@ -355,14 +378,15 @@ class CodexAppServerDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         state_root: Path | None = None,
         secret_key_name: str = "OPENAI_API_KEY",
         cli_binary: str = "codex",
         allow_cli_login: bool = True,
         app_server_cmd: Sequence[str] | None = None,
+        base_env: Mapping[str, str] | None = None,
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._state_root = (
             ensure_directory(Path(state_root))
             if state_root is not None
@@ -372,13 +396,19 @@ class CodexAppServerDriver:
         self._cli_binary = cli_binary
         self._allow_cli_login = allow_cli_login
         self._app_server_cmd = tuple(app_server_cmd) if app_server_cmd is not None else None
+        self._base_env = dict(base_env) if base_env is not None else None
         self._active_turns: dict[str, _ActiveCodexTurn] = {}
         self._completed_runs: dict[str, DriverRunResult] = {}
+
+    def _which_cli(self) -> str | None:
+        if self._base_env is not None and "PATH" in self._base_env:
+            return shutil.which(self._cli_binary, path=self._base_env.get("PATH"))
+        return shutil.which(self._cli_binary)
 
     def is_available(self) -> bool:
         if self._app_server_cmd is not None:
             return True
-        if shutil.which(self._cli_binary) is None:
+        if self._which_cli() is None:
             return False
         if self._secrets.has_secret(self._secret_key_name):
             return True
@@ -461,7 +491,7 @@ class CodexAppServerDriver:
     def _resolve_command(self) -> list[str]:
         if self._app_server_cmd is not None:
             return list(self._app_server_cmd)
-        resolved = shutil.which(self._cli_binary)
+        resolved = self._which_cli()
         if resolved is None:
             raise HarnessError(f"Codex binary {self._cli_binary!r} was not found on PATH.")
         return [resolved, "app-server", "--listen", "stdio://"]
@@ -473,9 +503,11 @@ class CodexAppServerDriver:
         workspace_path: str | None,
     ) -> tuple[_CodexJsonRpcConnection, str]:
         cmd = self._resolve_command()
-        env = dict(os.environ)
+        env = dict(self._base_env) if self._base_env is not None else dict(os.environ)
         if self._secrets.has_secret(self._secret_key_name):
-            env["OPENAI_API_KEY"] = self._secrets.require_secret(self._secret_key_name)
+            secret_val = self._secrets.require_secret(self._secret_key_name)
+            env[self._secret_key_name] = secret_val
+            env["OPENAI_API_KEY"] = secret_val
 
         scratch: tempfile.TemporaryDirectory[str] | None = None
         if workspace_path is not None:

@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, create_model
 
-from beast_harness.secrets import ChainedSecretProvider
+from beast_harness.secrets import ChainedSecretProvider, ensure_chained_secret_provider
 from beast_harness.types import (
     BH_NS,
     CapabilityValidationError,
@@ -20,6 +20,7 @@ from beast_harness.types import (
     ExecutionPosture,
     HarnessError,
     RunState,
+    SecretProvider,
     SessionRecord,
     VerifiedRepoRef,
     ensure_directory,
@@ -79,11 +80,11 @@ class AntigravitySdkDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         state_root: Path,
         secret_key_name: str = "GEMINI_API_KEY",
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._state_root = Path(state_root)
         self._secret_key_name = secret_key_name
         self._runs: dict[str, DriverRunResult] = {}

@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from beast_harness.secrets import ChainedSecretProvider
+from beast_harness.secrets import ChainedSecretProvider, ensure_chained_secret_provider
 from beast_harness.types import (
     BH_NS,
     DriverRunResult,
@@ -24,6 +27,7 @@ from beast_harness.types import (
     HarnessError,
     PostureViolationError,
     RunState,
+    SecretProvider,
     SessionRecord,
     VerifiedRepoRef,
 )
@@ -69,12 +73,12 @@ class CursorCloudDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         base_url: str = "https://api.cursor.com",
         http_client: httpx.AsyncClient | None = None,
         secret_key_name: str = "CURSOR_API_KEY",
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._base_url = base_url.rstrip("/")
         self._http_client = http_client
         self._secret_key_name = secret_key_name
@@ -429,19 +433,29 @@ class CursorLocalDriver:
     def __init__(
         self,
         *,
-        secrets: ChainedSecretProvider,
+        secrets: SecretProvider | ChainedSecretProvider,
         secret_key_name: str = "CURSOR_API_KEY",
         cli_binary: str = "cursor-agent",
+        base_env: Mapping[str, str] | None = None,
+        cli_timeout_seconds: float = 300.0,
     ) -> None:
-        self._secrets = secrets
+        self._secrets = ensure_chained_secret_provider(secrets)
         self._secret_key_name = secret_key_name
         self._cli_binary = cli_binary
+        self._base_env = dict(base_env) if base_env is not None else None
+        self._cli_timeout_seconds = max(1.0, float(cli_timeout_seconds))
         self._runs: dict[str, DriverRunResult] = {}
+        self._active_procs: dict[str, asyncio.subprocess.Process] = {}
+
+    def _which(self, binary: str) -> str | None:
+        if self._base_env is not None and "PATH" in self._base_env:
+            return shutil.which(binary, path=self._base_env.get("PATH"))
+        return shutil.which(binary)
 
     def is_available(self) -> bool:
-        has_runtime = shutil.which(self._cli_binary) is not None or (
+        has_runtime = self._which(self._cli_binary) is not None or (
             importlib.util.find_spec("cursor_sdk") is not None
-            and shutil.which("cursor-sdk-bridge") is not None
+            and self._which("cursor-sdk-bridge") is not None
         )
         return has_runtime and self._secrets.has_secret(self._secret_key_name)
 
@@ -481,6 +495,19 @@ class CursorLocalDriver:
 """
         return [ttl]
 
+    async def _terminate_proc(self, proc: asyncio.subprocess.Process) -> None:
+        if proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
     async def _run_via_cli(
         self,
         *,
@@ -491,7 +518,7 @@ class CursorLocalDriver:
         model: str | None,
         resume_chat_id: str | None,
     ) -> DriverRunResult:
-        cli_path = shutil.which(self._cli_binary)
+        cli_path = self._which(self._cli_binary)
         if cli_path is None:
             raise HarnessError(f"Cursor CLI {self._cli_binary!r} not found on PATH.")
 
@@ -502,7 +529,7 @@ class CursorLocalDriver:
             scratch = tempfile.TemporaryDirectory(prefix="cursor-repofree-")
             effective_cwd = str(Path(scratch.name).resolve())
 
-        env = dict(os.environ)
+        env = dict(self._base_env) if self._base_env is not None else dict(os.environ)
         env["CURSOR_API_KEY"] = api_key
 
         cmd: list[str] = [
@@ -525,6 +552,8 @@ class CursorLocalDriver:
             cmd.extend(["--resume", resume_chat_id])
         cmd.extend(["--", prompt])
 
+        tracking_key = resume_chat_id or f"cursor-pending-{uuid.uuid4().hex[:10]}"
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -533,8 +562,23 @@ class CursorLocalDriver:
                 cwd=effective_cwd,
                 env=env,
             )
-            stdout_b, stderr_b = await proc.communicate()
+            self._active_procs[tracking_key] = proc
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self._cli_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                await self._terminate_proc(proc)
+                raise HarnessError(
+                    f"cursor-agent timed out after {self._cli_timeout_seconds}s."
+                ) from exc
+        except BaseException:
+            if proc is not None and proc.returncode is None:
+                await self._terminate_proc(proc)
+            raise
         finally:
+            self._active_procs.pop(tracking_key, None)
             if scratch is not None:
                 scratch.cleanup()
 
@@ -585,7 +629,9 @@ class CursorLocalDriver:
         if posture == ExecutionPosture.OBSERVE_ONLY or independent_review:
             effective_prompt = f"{effective_prompt}{_OBSERVE_GUARDRAIL}"
 
-        if shutil.which("cursor-sdk-bridge") is None and shutil.which(self._cli_binary) is not None:
+        if (self._which("cursor-sdk-bridge") is None or self._base_env is not None) and self._which(
+            self._cli_binary
+        ) is not None:
             return await self._run_via_cli(
                 api_key=api_key,
                 prompt=effective_prompt,
@@ -600,7 +646,16 @@ class CursorLocalDriver:
         except ImportError as exc:
             raise HarnessError("cursor-sdk extra is not installed.") from exc
 
-        bridge = await cursor_sdk.AsyncBridge.launch(workspace=cwd)
+        launch_kwargs: dict[str, Any] = {"workspace": cwd}
+        if self._base_env is not None:
+            sig = inspect.signature(cursor_sdk.AsyncBridge.launch)
+            if "env" not in sig.parameters:
+                raise HarnessError(
+                    "cursor_sdk.AsyncBridge.launch does not support isolated base_env."
+                )
+            launch_kwargs["env"] = {**self._base_env, "CURSOR_API_KEY": api_key}
+
+        bridge = await cursor_sdk.AsyncBridge.launch(**launch_kwargs)
         client = cursor_sdk.AsyncClient(bridge.endpoint, auth_token=api_key)
         try:
             agent = await cursor_sdk.AsyncAgent.create(
@@ -644,7 +699,9 @@ class CursorLocalDriver:
         )
         merged_model = facets.get("model") or session.facets.get("model")
 
-        if shutil.which("cursor-sdk-bridge") is None and shutil.which(self._cli_binary) is not None:
+        if (self._which("cursor-sdk-bridge") is None or self._base_env is not None) and self._which(
+            self._cli_binary
+        ) is not None:
             return await self._run_via_cli(
                 api_key=api_key,
                 prompt=effective_prompt,
@@ -665,7 +722,16 @@ class CursorLocalDriver:
         if session.worktree_path:
             resume_opts["local"] = cursor_sdk.LocalAgentOptions(cwd=session.worktree_path)
 
-        bridge = await cursor_sdk.AsyncBridge.launch(workspace=session.worktree_path)
+        launch_kwargs: dict[str, Any] = {"workspace": session.worktree_path}
+        if self._base_env is not None:
+            sig = inspect.signature(cursor_sdk.AsyncBridge.launch)
+            if "env" not in sig.parameters:
+                raise HarnessError(
+                    "cursor_sdk.AsyncBridge.launch does not support isolated base_env."
+                )
+            launch_kwargs["env"] = {**self._base_env, "CURSOR_API_KEY": api_key}
+
+        bridge = await cursor_sdk.AsyncBridge.launch(**launch_kwargs)
         client = cursor_sdk.AsyncClient(bridge.endpoint, auth_token=api_key)
         try:
             agent = await cursor_sdk.AsyncAgent.resume(
@@ -710,6 +776,13 @@ class CursorLocalDriver:
         return await self.poll_run(session=session)
 
     async def cancel_run(self, *, session: SessionRecord) -> DriverRunResult:
+        active_proc = self._active_procs.pop(session.native_agent_id, None)
+        if active_proc is not None:
+            await self._terminate_proc(active_proc)
+        for key, proc in list(self._active_procs.items()):
+            if key.startswith("cursor-pending-"):
+                self._active_procs.pop(key, None)
+                await self._terminate_proc(proc)
         cancelled = DriverRunResult(
             native_agent_id=session.native_agent_id,
             run_id=session.latest_run_id,

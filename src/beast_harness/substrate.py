@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,7 +23,12 @@ from beast_harness.drivers.codex_driver import CodexAppServerDriver
 from beast_harness.drivers.cursor_driver import CursorCloudDriver, CursorLocalDriver
 from beast_harness.ledger import SessionLedger
 from beast_harness.ref_verifier import PublishedRefVerifier
-from beast_harness.secrets import ChainedSecretProvider, EnvSecretProvider, SecretProvider
+from beast_harness.secrets import (
+    ChainedSecretProvider,
+    EnvSecretProvider,
+    SecretProvider,
+    ensure_chained_secret_provider,
+)
 from beast_harness.types import (
     BH_NS,
     CapabilityValidationError,
@@ -64,7 +69,7 @@ class HarnessSubstrate:
         ref_verifier: PublishedRefVerifier,
         drivers: Sequence[HarnessDriver],
         beast_peer_driver: BeastPeerDriver | None = None,
-        admitted_capability_digests: dict[str, str] | None = None,
+        admitted_capability_digests: Mapping[str, str | Collection[str]] | None = None,
         caller_inbox_notifier: Any | None = None,
     ) -> None:
         self._ledger = ledger
@@ -73,7 +78,15 @@ class HarnessSubstrate:
         self._beast_peer_driver = beast_peer_driver
         if beast_peer_driver is not None:
             self._drivers_by_id[beast_peer_driver.driver_id] = beast_peer_driver
-        self._admitted_digests = dict(admitted_capability_digests or {})
+        normalized_admitted: dict[str, frozenset[str]] = {}
+        for ep_id, raw_val in (admitted_capability_digests or {}).items():
+            if isinstance(raw_val, str):
+                cleaned = {raw_val.strip().lower()} if raw_val.strip() else set()
+            else:
+                cleaned = {str(v).strip().lower() for v in raw_val if str(v).strip()}
+            if cleaned:
+                normalized_admitted[str(ep_id)] = frozenset(cleaned)
+        self._admitted_digests = normalized_admitted
         self._caller_inbox_notifier = caller_inbox_notifier
 
     async def _all_endpoints(self) -> list[EndpointDescriptor]:
@@ -105,10 +118,10 @@ class HarnessSubstrate:
         return sorted(endpoints_by_id.values(), key=lambda e: e.endpoint_id)
 
     def _normalize_trust_tier(self, ep: EndpointDescriptor) -> EndpointDescriptor:
-        expected_digest = self._admitted_digests.get(ep.endpoint_id)
+        allowed_digests = self._admitted_digests.get(ep.endpoint_id)
         tier = (
             TrustTier.NEO4J_ADMITTED
-            if (expected_digest and expected_digest == ep.capability_graph_digest)
+            if (allowed_digests and ep.capability_graph_digest.lower() in allowed_digests)
             else TrustTier.RUNTIME_SELF_ANNOUNCED
         )
         return ep.model_copy(update={"trust_tier": tier})
@@ -455,15 +468,20 @@ class HarnessSubstrate:
         return await self.wait(started.session_id, timeout_seconds=timeout_seconds)
 
 
-def _default_beast_peer_driver(secrets: ChainedSecretProvider) -> BeastPeerDriver | None:
-    redis_url = os.environ.get("REDIS_URL")
-    redis_host = os.environ.get("BEAST_REDIS_HOST") or os.environ.get("REDIS_HOST")
+def _default_beast_peer_driver(
+    secrets: ChainedSecretProvider,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> BeastPeerDriver | None:
+    source = env if env is not None else os.environ
+    redis_url = source.get("REDIS_URL")
+    redis_host = source.get("BEAST_REDIS_HOST") or source.get("REDIS_HOST")
     if not redis_url and not redis_host:
         return None
 
     host = redis_host or "localhost"
-    port = int(os.environ.get("BEAST_REDIS_PORT") or os.environ.get("REDIS_PORT") or "6379")
-    db = int(os.environ.get("BEAST_REDIS_DB", "0"))
+    port = int(source.get("BEAST_REDIS_PORT") or source.get("REDIS_PORT") or "6379")
+    db = int(source.get("BEAST_REDIS_DB", "0"))
     if redis_url and not redis_host:
         parsed = urlsplit(redis_url)
         if parsed.hostname:
@@ -473,7 +491,7 @@ def _default_beast_peer_driver(secrets: ChainedSecretProvider) -> BeastPeerDrive
         if parsed.path and parsed.path.strip("/").isdigit():
             db = int(parsed.path.strip("/"))
 
-    caller_id = os.environ.get("BEAST_CALLER_AGENT_ID", "beast-harness-mcp")
+    caller_id = source.get("BEAST_CALLER_AGENT_ID", "beast-harness-mcp")
     candidate = BeastPeerDriver(
         caller_agent_id=caller_id,
         redis_host=host,
@@ -484,8 +502,11 @@ def _default_beast_peer_driver(secrets: ChainedSecretProvider) -> BeastPeerDrive
     return candidate if candidate.is_available() else None
 
 
-def _load_env_admitted_digests() -> dict[str, str]:
-    raw = os.environ.get("BEAST_HARNESS_ADMITTED_DIGESTS_JSON")
+def _load_env_admitted_digests(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str | tuple[str, ...]]:
+    source = env if env is not None else os.environ
+    raw = source.get("BEAST_HARNESS_ADMITTED_DIGESTS_JSON")
     if not raw or not raw.strip():
         return {}
     parsed = json.loads(raw)
@@ -493,51 +514,69 @@ def _load_env_admitted_digests() -> dict[str, str]:
         raise CapabilityValidationError(
             "BEAST_HARNESS_ADMITTED_DIGESTS_JSON must decode to a JSON object."
         )
-    return {str(k): str(v) for k, v in parsed.items()}
+    out: dict[str, str | tuple[str, ...]] = {}
+    for k, v in parsed.items():
+        if isinstance(v, list):
+            out[str(k)] = tuple(str(item) for item in v)
+        else:
+            out[str(k)] = str(v)
+    return out
 
 
 def create_default_substrate(
     state_dir: Path | None = None,
     *,
     secrets: SecretProvider | None = None,
-    admitted_capability_digests: dict[str, str] | None = None,
-    drivers: list[HarnessDriver] | None = None,
+    admitted_capability_digests: Mapping[str, str | Collection[str]] | None = None,
+    drivers: Sequence[HarnessDriver] | None = None,
+    base_env: Mapping[str, str] | None = None,
+    include_beast_peers: bool = True,
 ) -> HarnessSubstrate:
-    env_state = os.environ.get("BEAST_HARNESS_STATE_DIR")
-    resolved_root = (
-        Path(state_dir)
-        if state_dir is not None
-        else (Path(env_state) if env_state else Path.home() / ".beast-harness")
-    )
-    root = ensure_directory(resolved_root)
-    env_db = os.environ.get("BEAST_HARNESS_DB")
-    db_path = Path(env_db) if env_db else root / "sessions.sqlite3"
+    env_source = base_env if base_env is not None else os.environ
+    if state_dir is not None:
+        root = ensure_directory(Path(state_dir))
+        db_path = root / "sessions.sqlite3"
+    else:
+        env_state = env_source.get("BEAST_HARNESS_STATE_DIR")
+        resolved_root = Path(env_state) if env_state else Path.home() / ".beast-harness"
+        root = ensure_directory(resolved_root)
+        env_db = env_source.get("BEAST_HARNESS_DB")
+        db_path = Path(env_db) if env_db else root / "sessions.sqlite3"
+
     effective_secrets = (
-        secrets if secrets is not None else ChainedSecretProvider([EnvSecretProvider()])
+        ensure_chained_secret_provider(secrets)
+        if secrets is not None
+        else ChainedSecretProvider([EnvSecretProvider(base_env)])
     )
     effective_drivers: list[HarnessDriver] = (
         list(drivers)
         if drivers is not None
         else [
             CursorCloudDriver(secrets=effective_secrets),
-            CursorLocalDriver(secrets=effective_secrets),
+            CursorLocalDriver(secrets=effective_secrets, base_env=base_env),
             AntigravitySdkDriver(secrets=effective_secrets, state_root=root / "antigravity"),
-            ClaudeManagedDriver(secrets=effective_secrets),
-            ClaudeSdkDriver(secrets=effective_secrets),
-            CodexAppServerDriver(secrets=effective_secrets, state_root=root / "codex"),
+            ClaudeManagedDriver(secrets=effective_secrets, base_env=base_env),
+            ClaudeSdkDriver(secrets=effective_secrets, base_env=base_env),
+            CodexAppServerDriver(
+                secrets=effective_secrets,
+                state_root=root / "codex",
+                base_env=base_env,
+            ),
         ]
     )
     effective_admitted = (
         dict(admitted_capability_digests)
         if admitted_capability_digests is not None
-        else _load_env_admitted_digests()
+        else _load_env_admitted_digests(env_source)
     )
     return HarnessSubstrate(
         ledger=SessionLedger(db_path),
         ref_verifier=PublishedRefVerifier(root / "worktrees"),
         drivers=effective_drivers,
         beast_peer_driver=(
-            _default_beast_peer_driver(effective_secrets) if drivers is None else None
+            _default_beast_peer_driver(effective_secrets, env=env_source)
+            if (drivers is None and include_beast_peers)
+            else None
         ),
         admitted_capability_digests=effective_admitted,
     )

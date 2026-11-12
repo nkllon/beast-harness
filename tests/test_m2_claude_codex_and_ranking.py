@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import warnings
@@ -727,3 +728,320 @@ for raw in sys.stdin:
     final_st = json.loads(state_file.read_text())
     assert any("Focus on edge cases" in s for s in final_st["steered"])
     assert len(final_st["interrupted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_m2_security_hardening_secret_protocol_base_env_stderr_and_propose_diff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import claude_agent_sdk as cas
+
+    from beast_harness.substrate import create_default_substrate
+    from beast_harness.types import TrustTier
+
+    # 1. [B-2] Custom SecretProvider implementing ONLY has_secret/get_secret (no require_secret)
+    raw_provider = _SingleUseSecretProvider({"OPENAI_API_KEY": "sk-brokered-single-use"})
+    assert not hasattr(raw_provider, "require_secret")
+
+    # 2. [B-3] Poison ambient os.environ with secrets and BEAST_HARNESS_DB / REDIS_URL
+    monkeypatch.setenv("NEO4J_PASSWORD", "top-secret-neo4j-pw")
+    monkeypatch.setenv("MAGPIE_GUARDED_RECEIPT_ID", "magpie-secret-receipt-999")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient-leak")
+    monkeypatch.setenv("BEAST_HARNESS_DB", str(tmp_path / "hijacked.sqlite3"))
+    monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6399/0")
+
+    env_dump_file = tmp_path / "child_env_dump.json"
+    stderr_flood_codex = tmp_path / "stderr_flood_codex.py"
+    stderr_flood_codex.write_text(
+        f"""\
+import json
+import os
+import pathlib
+import sys
+
+pathlib.Path({str(env_dump_file)!r}).write_text(json.dumps(dict(os.environ)))
+# [M-3] Emit >256 KB to stderr to ensure _stderr_drain_loop prevents pipe deadlock
+sys.stderr.write(("RUST_TRACE_LINE_" + ("X" * 512) + "\\n") * 600)
+sys.stderr.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {{}}
+    if method == "initialize":
+        sys.stdout.write(json.dumps({{"id": req_id, "result": {{}}}}) + "\\n")
+        sys.stdout.flush()
+    elif method == "thread/start":
+        sys.stdout.write(
+            json.dumps({{"id": req_id, "result": {{"thread": {{"id": "thr_sec_1"}}}}}}) + "\\n"
+        )
+        sys.stdout.flush()
+    elif method == "turn/start":
+        turn_start_resp = {{
+            "id": req_id,
+            "result": {{"turn": {{"id": "t_sec_1", "status": "inProgress"}}}},
+        }}
+        sys.stdout.write(json.dumps(turn_start_resp) + "\\n")
+        msg_item = {{"type": "agentMessage", "id": "m1", "text": "ISOLATED_OK"}}
+        sys.stdout.write(
+            json.dumps({{
+                "method": "item/completed",
+                "params": {{"threadId": "thr_sec_1", "item": msg_item}},
+            }}) + "\\n"
+        )
+        done_turn = {{"id": "t_sec_1", "status": "completed"}}
+        sys.stdout.write(
+            json.dumps({{
+                "method": "turn/completed",
+                "params": {{"threadId": "thr_sec_1", "turn": done_turn}},
+            }}) + "\\n"
+        )
+        sys.stdout.flush()
+"""
+    )
+
+    clean_base_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
+    codex_drv = CodexAppServerDriver(
+        secrets=raw_provider,
+        state_root=tmp_path / "codex_sec",
+        app_server_cmd=[sys.executable, "-u", str(stderr_flood_codex)],
+        base_env=clean_base_env,
+    )
+    observed_digest = parse_and_validate_capability_ttl(codex_drv.announce_capabilities_ttl()[0])[
+        0
+    ].capability_graph_digest
+
+    # [M-1] Multi-digest set admission + [B-3] explicit state_dir overrides BEAST_HARNESS_DB
+    explicit_state_dir = tmp_path / "explicit_state"
+    substrate = create_default_substrate(
+        explicit_state_dir,
+        secrets=raw_provider,
+        admitted_capability_digests={
+            "codex-app-server": {"0" * 64, observed_digest},
+        },
+        drivers=[codex_drv],
+        base_env=clean_base_env,
+        include_beast_peers=False,
+    )
+    assert (explicit_state_dir / "sessions.sqlite3").exists()
+    assert not (tmp_path / "hijacked.sqlite3").exists()
+
+    eps = await substrate.discover(DiscoveryQuery(min_trust_tier=TrustTier.NEO4J_ADMITTED))
+    assert [e.endpoint_id for e in eps] == ["codex-app-server"]
+
+    rec = await substrate.start(
+        prompt="Verify env scrubbing and stderr drain",
+        target_endpoint_id="codex-app-server",
+    )
+    assert rec.status == RunState.FINISHED
+    assert rec.answer == "ISOLATED_OK"
+    assert raw_provider.get_calls == {"OPENAI_API_KEY": 1}
+
+    child_env = json.loads(env_dump_file.read_text())
+    assert "NEO4J_PASSWORD" not in child_env
+    assert "MAGPIE_GUARDED_RECEIPT_ID" not in child_env
+    assert "ANTHROPIC_API_KEY" not in child_env
+    assert child_env.get("OPENAI_API_KEY") == "sk-brokered-single-use"
+
+    # 3. [M-4] ClaudeSdkDriver ProposeDiff workspace confinement & tool allowlist
+    ws_dir = tmp_path / "propose_ws"
+    ws_dir.mkdir()
+    outside_file = tmp_path / "outside_secret.txt"
+    outside_file.write_text("do not touch")
+
+    claude_drv = ClaudeSdkDriver(
+        secrets=raw_provider,
+        secret_key_name="OPENAI_API_KEY",
+        allow_cli_login=False,
+        base_env=clean_base_env,
+    )
+    propose_opts = claude_drv.build_agent_options(
+        workspace_path=str(ws_dir),
+        posture=ExecutionPosture.PROPOSE_DIFF,
+        facets={},
+        api_key="sk-ant-brokered",
+    )
+    assert propose_opts.env.get("ANTHROPIC_API_KEY") == "sk-ant-brokered"
+    assert "NEO4J_PASSWORD" not in propose_opts.env
+
+    in_ws = await propose_opts.can_use_tool("Edit", {"file_path": "sub/file.py"}, None)
+    escape_rel = await propose_opts.can_use_tool(
+        "Write", {"file_path": "../outside_secret.txt"}, None
+    )
+    escape_abs = await propose_opts.can_use_tool("Edit", {"file_path": str(outside_file)}, None)
+    deny_task = await propose_opts.can_use_tool("Task", {"prompt": "spawn"}, None)
+    deny_web = await propose_opts.can_use_tool("WebFetch", {"url": "https://evil.test"}, None)
+    deny_mcp = await propose_opts.can_use_tool("mcp__ext__run", {}, None)
+
+    assert isinstance(in_ws, cas.PermissionResultAllow)
+    assert isinstance(escape_rel, cas.PermissionResultDeny)
+    assert isinstance(escape_abs, cas.PermissionResultDeny)
+    assert isinstance(deny_task, cas.PermissionResultDeny)
+    assert isinstance(deny_web, cas.PermissionResultDeny)
+    assert isinstance(deny_mcp, cas.PermissionResultDeny)
+
+    # Without workspace_path, ProposeDiff denies file edits fail-closed
+    no_ws_opts = claude_drv.build_agent_options(
+        workspace_path=None,
+        posture=ExecutionPosture.PROPOSE_DIFF,
+        facets={},
+    )
+    deny_no_ws = await no_ws_opts.can_use_tool("Write", {"file_path": "file.py"}, None)
+    assert isinstance(deny_no_ws, cas.PermissionResultDeny)
+
+
+@pytest.mark.asyncio
+async def test_claude_managed_historical_sse_idle_and_followup_vault_guard(tmp_path: Path):
+    events_by_sid: dict[str, list[dict[str, Any]]] = {}
+
+    async def create_session(request: Request):
+        body = await request.json()
+        sid = "sesn_replay_1"
+        events_by_sid[sid] = [
+            *list(body.get("initial_events") or []),
+            {
+                "id": "ev_1",
+                "type": "agent.message",
+                "content": [{"type": "text", "text": "Turn 1 answer"}],
+            },
+            # Historical Turn 1 idle persisted in replay stream!
+            {"id": "ev_idle_1", "type": "session.status_idle"},
+        ]
+        return JSONResponse({"id": sid, "type": "session", "status": "running"})
+
+    async def get_session(request: Request):
+        return JSONResponse({"id": request.path_params["sid"], "type": "session", "status": "idle"})
+
+    async def handle_events(request: Request):
+        sid = request.path_params["sid"]
+        if request.method == "GET":
+            return JSONResponse({"data": events_by_sid[sid]})
+        body = await request.json()
+        for ev in body.get("events", []):
+            events_by_sid[sid].append(ev)
+            if ev.get("type") == "user.message":
+                events_by_sid[sid].append(
+                    {
+                        "id": "ev_2",
+                        "type": "agent.message",
+                        "content": [
+                            {"type": "text", "text": "Turn 2 answer after historical idle"}
+                        ],
+                    }
+                )
+                events_by_sid[sid].append({"id": "ev_idle_2", "type": "session.status_idle"})
+        return JSONResponse({"data": []})
+
+    async def stream_events(request: Request):
+        sid = request.path_params["sid"]
+
+        async def _gen():
+            for ev in events_by_sid[sid]:
+                yield f"data: {json.dumps(ev)}\n\n"
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    app = Starlette(
+        routes=[
+            Route("/v1/sessions", create_session, methods=["POST"]),
+            Route("/v1/sessions/{sid}", get_session, methods=["GET"]),
+            Route("/v1/sessions/{sid}/events", handle_events, methods=["GET", "POST"]),
+            Route("/v1/sessions/{sid}/events/stream", stream_events, methods=["GET"]),
+        ]
+    )
+
+    raw_provider = _SingleUseSecretProvider({"ANTHROPIC_API_KEY": "sk-ant-replay"})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://claude.local",
+    ) as client:
+        driver = ClaudeManagedDriver(
+            secrets=raw_provider,
+            base_url="http://claude.local",
+            http_client=client,
+            default_agent_id="ag_1",
+            default_environment_id="env_1",
+        )
+        substrate = HarnessSubstrate(
+            ledger=SessionLedger(tmp_path / "replay.sqlite3"),
+            ref_verifier=PublishedRefVerifier(tmp_path / "wt"),
+            drivers=[driver],
+        )
+        s1 = await substrate.start(prompt="Turn 1", target_endpoint_id="claude-managed")
+        s1_done = await substrate.wait(s1.session_id, timeout_seconds=5.0)
+        assert s1_done.answer == "Turn 1 answer"
+
+        # [m-3] ObserveOnly follow-up rejects vault_ids fail-closed
+        with pytest.raises(PostureViolationError):
+            await substrate.send(
+                session_id=s1.session_id,
+                prompt="Try vaults on follow-up",
+                facets={"vault_ids": ["vlt_999"]},
+            )
+
+        await substrate.send(session_id=s1.session_id, prompt="Turn 2")
+        s2_done = await substrate.wait(s1.session_id, timeout_seconds=5.0)
+        assert s2_done.status == RunState.FINISHED
+        assert s2_done.answer == "Turn 2 answer after historical idle"
+
+
+@pytest.mark.asyncio
+async def test_cursor_local_cli_base_env_isolation_and_timeout_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from beast_harness.types import HarnessError
+
+    monkeypatch.setenv("NEO4J_PASSWORD", "cursor-should-not-see-this")
+    env_out = tmp_path / "cursor_env.json"
+    fake_cursor = tmp_path / "cursor-agent"
+    fake_cursor.write_text(
+        f"""\
+#!{sys.executable}
+import json, os, pathlib, sys, time
+pathlib.Path({str(env_out)!r}).write_text(json.dumps(dict(os.environ)))
+if "HANG_TEST" in " ".join(sys.argv):
+    time.sleep(30)
+print(json.dumps({{"session_id": "cur_loc_1", "result": "Cursor isolated ok"}}))
+"""
+    )
+    fake_cursor.chmod(0o755)
+
+    clean_env = {"PATH": f"{tmp_path}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    raw_provider = _SingleUseSecretProvider({"CURSOR_API_KEY": "cur-brokered-key"})
+    drv = CursorLocalDriver(
+        secrets=raw_provider,
+        cli_binary=str(fake_cursor),
+        base_env=clean_env,
+        cli_timeout_seconds=1.0,
+    )
+    ep = parse_and_validate_capability_ttl(drv.announce_capabilities_ttl()[0])[0]
+    res = await drv.start_run(
+        endpoint=ep,
+        prompt="Quick check",
+        repo_ref=None,
+        posture=ExecutionPosture.OBSERVE_ONLY,
+        facets={},
+        independent_review=True,
+    )
+    assert res.state == RunState.FINISHED
+    assert res.answer == "Cursor isolated ok"
+    observed_env = json.loads(env_out.read_text())
+    assert "NEO4J_PASSWORD" not in observed_env
+    assert observed_env.get("CURSOR_API_KEY") == "cur-brokered-key"
+
+    with pytest.raises(HarnessError, match="timed out"):
+        await drv.start_run(
+            endpoint=ep,
+            prompt="HANG_TEST",
+            repo_ref=None,
+            posture=ExecutionPosture.OBSERVE_ONLY,
+            facets={},
+            independent_review=True,
+        )
+    assert drv._active_procs == {}

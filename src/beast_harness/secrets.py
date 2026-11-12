@@ -123,3 +123,14 @@ class ChainedSecretProvider:
 
     def __repr__(self) -> str:
         return f"ChainedSecretProvider(providers={self._providers!r})"
+
+
+def ensure_chained_secret_provider(
+    secrets: SecretProvider | ChainedSecretProvider | None,
+) -> ChainedSecretProvider:
+    """Wrap any SecretProvider protocol implementation in ChainedSecretProvider."""
+    if isinstance(secrets, ChainedSecretProvider):
+        return secrets
+    if secrets is None:
+        return ChainedSecretProvider([EnvSecretProvider()])
+    return ChainedSecretProvider([secrets])
