@@ -23,7 +23,7 @@ from beast_harness.drivers.codex_driver import CodexAppServerDriver
 from beast_harness.drivers.cursor_driver import CursorCloudDriver, CursorLocalDriver
 from beast_harness.ledger import SessionLedger
 from beast_harness.ref_verifier import PublishedRefVerifier
-from beast_harness.secrets import ChainedSecretProvider, EnvSecretProvider
+from beast_harness.secrets import ChainedSecretProvider, EnvSecretProvider, SecretProvider
 from beast_harness.types import (
     BH_NS,
     CapabilityValidationError,
@@ -496,7 +496,13 @@ def _load_env_admitted_digests() -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
-def create_default_substrate(state_dir: Path | None = None) -> HarnessSubstrate:
+def create_default_substrate(
+    state_dir: Path | None = None,
+    *,
+    secrets: SecretProvider | None = None,
+    admitted_capability_digests: dict[str, str] | None = None,
+    drivers: list[HarnessDriver] | None = None,
+) -> HarnessSubstrate:
     env_state = os.environ.get("BEAST_HARNESS_STATE_DIR")
     resolved_root = (
         Path(state_dir)
@@ -506,19 +512,32 @@ def create_default_substrate(state_dir: Path | None = None) -> HarnessSubstrate:
     root = ensure_directory(resolved_root)
     env_db = os.environ.get("BEAST_HARNESS_DB")
     db_path = Path(env_db) if env_db else root / "sessions.sqlite3"
-    secrets = ChainedSecretProvider([EnvSecretProvider()])
-    drivers: list[HarnessDriver] = [
-        CursorCloudDriver(secrets=secrets),
-        CursorLocalDriver(secrets=secrets),
-        AntigravitySdkDriver(secrets=secrets, state_root=root / "antigravity"),
-        ClaudeManagedDriver(secrets=secrets),
-        ClaudeSdkDriver(secrets=secrets),
-        CodexAppServerDriver(secrets=secrets, state_root=root / "codex"),
-    ]
+    effective_secrets = (
+        secrets if secrets is not None else ChainedSecretProvider([EnvSecretProvider()])
+    )
+    effective_drivers: list[HarnessDriver] = (
+        list(drivers)
+        if drivers is not None
+        else [
+            CursorCloudDriver(secrets=effective_secrets),
+            CursorLocalDriver(secrets=effective_secrets),
+            AntigravitySdkDriver(secrets=effective_secrets, state_root=root / "antigravity"),
+            ClaudeManagedDriver(secrets=effective_secrets),
+            ClaudeSdkDriver(secrets=effective_secrets),
+            CodexAppServerDriver(secrets=effective_secrets, state_root=root / "codex"),
+        ]
+    )
+    effective_admitted = (
+        dict(admitted_capability_digests)
+        if admitted_capability_digests is not None
+        else _load_env_admitted_digests()
+    )
     return HarnessSubstrate(
         ledger=SessionLedger(db_path),
         ref_verifier=PublishedRefVerifier(root / "worktrees"),
-        drivers=drivers,
-        beast_peer_driver=_default_beast_peer_driver(secrets),
-        admitted_capability_digests=_load_env_admitted_digests(),
+        drivers=effective_drivers,
+        beast_peer_driver=(
+            _default_beast_peer_driver(effective_secrets) if drivers is None else None
+        ),
+        admitted_capability_digests=effective_admitted,
     )
